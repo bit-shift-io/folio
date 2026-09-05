@@ -1,10 +1,12 @@
 //! Embedded Axum server: file browser HTTP endpoints + change-hint
-//! WebSocket channel.
+//! WebSocket channel. Handlers operate on absolute paths; the CLI `--root`
+//! only sets the initial directory, browsing is unrestricted.
 
 pub mod static_files;
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -14,7 +16,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use notify::Watcher;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::fs;
 
@@ -30,7 +32,7 @@ const SEARCH_LIMIT: usize = 200;
 pub struct ChangeHint {
     #[serde(rename = "type")]
     pub kind: String,
-    /// Root-relative directory path to refetch; `""` means the root.
+    /// Absolute directory path to refetch.
     pub path: String,
 }
 
@@ -43,39 +45,139 @@ impl ChangeHint {
     }
 }
 
-/// Shared server state: the browsable root and the change-hint broadcaster.
+/// Shared server state: initial dir, home dir (for `~` in the path bar), the
+/// change-hint broadcaster, and a channel that tells the watcher which
+/// directory to follow.
 #[derive(Clone)]
 pub struct AppState {
     root: String,
     root_marker: PathBuf,
+    home: String,
     tx: broadcast::Sender<ChangeHint>,
+    watch_tx: mpsc::UnboundedSender<PathBuf>,
+    watch_rx: Arc<std::sync::Mutex<Option<mpsc::UnboundedReceiver<PathBuf>>>>,
+    themes_dir: PathBuf,
 }
 
 impl AppState {
     pub fn new(root: PathBuf) -> Self {
         let (tx, _) = broadcast::channel(256);
+        let (watch_tx, watch_rx) = mpsc::unbounded_channel();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let themes_dir = std::env::current_dir()
+            .unwrap_or_default()
+            .join("res")
+            .join("icons");
         Self {
             root_marker: root.clone(),
             root: root.display().to_string(),
+            home,
             tx,
+            watch_tx,
+            watch_rx: Arc::new(std::sync::Mutex::new(Some(watch_rx))),
+            themes_dir,
         }
     }
 
     pub fn spawn_watcher(&self) {
-        spawn_watcher(self.root_marker.clone(), self.tx.clone());
+        let rx = self
+            .watch_rx
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        let Some(rx) = rx else {
+            tracing::warn!("file watcher already spawned once");
+            return;
+        };
+        spawn_watcher(self.root_marker.clone(), rx, self.tx.clone());
     }
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Info {
     pub root: String,
+    pub home: String,
 }
 
-/// Reports the browsable root (with `$HOME` abbreviated to `~`).
+/// Reports the initial directory and the user's home (for `~` expansion).
 pub async fn info_json(State(state): State<AppState>) -> Json<Info> {
     Json(Info {
         root: state.root.clone(),
+        home: state.home.clone(),
     })
+}
+
+/// Serves an icon theme asset from disk: `/icons/<theme>/<subdir>/<file>`,
+/// rooted at the themes directory (`res/icons`). The theme name is the first
+/// path segment and everything after it must stay inside that theme's folder.
+pub async fn icon_handler(
+    State(state): State<AppState>,
+    axum::extract::Path((theme, path)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let theme_p = Path::new(&theme);
+    let theme_ok = !theme.is_empty()
+        && theme_p.components().count() == 1
+        && theme_p
+            .components()
+            .next()
+            .is_some_and(|c| matches!(c, Component::Normal(_)));
+    if !theme_ok {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let rel = Path::new(&path);
+    let rel_ok = !rel
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)));
+    if !rel_ok {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let file = state.themes_dir.join(&theme).join(rel);
+    match std::fs::read(&file) {
+        Ok(bytes) => {
+            let mime = if file.extension().is_some_and(|e| e == "svg") {
+                "image/svg+xml"
+            } else {
+                fs::mime_for_path(&file.display().to_string())
+            };
+            ([(header::CONTENT_TYPE, mime)], bytes).into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(e) => {
+            tracing::warn!("failed to read {}: {e}", file.display());
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Resolves a client-supplied path: empty → the initial root; absolute →
+/// used as-is; otherwise joined onto the initial root. There is no
+/// confinement — `..` is resolved by the OS, exactly as a shell would.
+fn resolve_path(raw: &str, base: &Path) -> PathBuf {
+    if raw.is_empty() {
+        return base.to_path_buf();
+    }
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    }
+}
+
+/// Parent directory of an absolute path. `/etc/x` → `/etc`; `/etc/` → `/etc`;
+/// `/` → `/`.
+fn parent_of_abs(p: &str) -> String {
+    let p = p.trim_end_matches('/');
+    if p.is_empty() {
+        return "/".to_string();
+    }
+    match p.rfind('/') {
+        Some(0) => "/".to_string(),
+        Some(i) => p[..i].to_string(),
+        None => "/".to_string(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -88,18 +190,19 @@ pub async fn filetree_handler(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<FileTreeQuery>,
 ) -> (StatusCode, Json<Vec<fs::FileTreeEntry>>) {
-    let root = PathBuf::from(&state.root_marker);
-    match tokio::task::spawn_blocking(move || fs::list_dir(&root, &query.path)).await {
-        Ok(entries) => (StatusCode::OK, Json(entries)),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(vec![fs::FileTreeEntry {
-                name: format!("listing task panicked: {e}"),
-                path: String::new(),
-                is_dir: false,
-                depth: 0,
-            }]),
-        ),
+    let base = resolve_path(&query.path, &state.root_marker);
+    match tokio::task::spawn_blocking(move || fs::list_dir(&base)).await {
+        Ok(Ok(entries)) => (StatusCode::OK, Json(entries)),
+        Ok(Err(fs::ListError::NotFound)) => (StatusCode::NOT_FOUND, Json(Vec::new())),
+        Ok(Err(fs::ListError::NotADirectory)) => (StatusCode::BAD_REQUEST, Json(Vec::new())),
+        Ok(Err(fs::ListError::Io(e))) => {
+            tracing::warn!("list_dir failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::new()))
+        }
+        Err(e) => {
+            tracing::warn!("filetree task panicked: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::new()))
+        }
     }
 }
 
@@ -114,26 +217,25 @@ pub async fn filecontent_handler(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<FileContentQuery>,
 ) -> Response {
+    let base = resolve_path(&query.path, &state.root_marker);
+    let path_str = base.display().to_string();
     if query.raw {
-        let root = state.root_marker.clone();
-        let Some(full) = fs::safe_join(&root, &query.path) else {
-            return (
-                StatusCode::BAD_REQUEST,
-                "path escapes the root directory".to_string(),
-            )
-                .into_response();
-        };
-        let file_path = query.path.clone();
-        match tokio::task::spawn_blocking(move || std::fs::read(&full)).await {
+        match tokio::task::spawn_blocking(move || std::fs::read(&base)).await {
             Ok(Ok(bytes)) => {
-                let mime = fs::mime_for_path(&file_path);
+                let mime = fs::mime_for_path(&path_str);
                 ([(header::CONTENT_TYPE, mime)], bytes).into_response()
             }
-            Ok(Err(e)) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to read {}: {e}", file_path),
-            )
-                .into_response(),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                (StatusCode::NOT_FOUND, format!("no such file: {path_str}")).into_response()
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("failed to read {}: {e}", path_str);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to read {path_str}"),
+                )
+                    .into_response()
+            }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("read task panicked: {e}"),
@@ -141,19 +243,10 @@ pub async fn filecontent_handler(
                 .into_response(),
         }
     } else {
-        let Some(_full) = fs::safe_join(&state.root_marker, &query.path) else {
-            return (
-                StatusCode::BAD_REQUEST,
-                "path escapes the root directory".to_string(),
-            )
-                .into_response();
-        };
-        let root = state.root_marker.clone();
-        let path = query.path.clone();
-        match tokio::task::spawn_blocking(move || fs::get_file_content(&root, &path)).await {
+        match tokio::task::spawn_blocking(move || fs::get_file_content(&base)).await {
             Ok(content) => Json(content).into_response(),
             Err(e) => Json(fs::FileContent {
-                path: query.path,
+                path: path_str.clone(),
                 size: 0,
                 is_binary: false,
                 is_image: false,
@@ -168,25 +261,23 @@ pub async fn filecontent_handler(
 #[derive(Deserialize)]
 pub struct FileSearchQuery {
     q: String,
+    /// Search base directory; defaults to the initial root.
+    #[serde(default)]
+    path: String,
 }
 
 pub async fn filesearch_handler(
     State(state): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<FileSearchQuery>,
 ) -> (StatusCode, Json<Vec<fs::FileTreeEntry>>) {
-    let root = state.root_marker.clone();
+    let base = resolve_path(&query.path, &state.root_marker);
     let q = query.q;
-    match tokio::task::spawn_blocking(move || fs::search_files(&root, &q, SEARCH_LIMIT)).await {
+    match tokio::task::spawn_blocking(move || fs::search_files(&base, &q, SEARCH_LIMIT)).await {
         Ok(entries) => (StatusCode::OK, Json(entries)),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(vec![fs::FileTreeEntry {
-                name: format!("search task panicked: {e}"),
-                path: String::new(),
-                is_dir: false,
-                depth: 0,
-            }]),
-        ),
+        Err(e) => {
+            tracing::warn!("search task panicked: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(Vec::new()))
+        }
     }
 }
 
@@ -208,42 +299,39 @@ fn broadcast_after_mutation(state: &AppState, paths: Vec<String>) {
     }
 }
 
-/// Parent directory of a root-relative path, also root-relative. `""` for
-/// anything at or above the root.
-pub fn parent_rel(rel: &str) -> String {
-    match rel.rfind('/') {
-        Some(idx) => rel[..idx].to_string(),
-        None => String::new(),
-    }
-}
-
 pub async fn rename_handler(
     State(state): State<AppState>,
     Json(body): Json<MutateRequest>,
 ) -> Response {
-    let root = state.root_marker.clone();
-    let from = body.path.clone();
-    let to = body.to.clone();
+    if body.to.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(MutateResponse { ok: false }),
+        )
+            .into_response();
+    }
+    let from = resolve_path(&body.path, &state.root_marker);
+    let to = resolve_path(&body.to, &state.root_marker);
+    let from_s = from.display().to_string();
+    let to_s = to.display().to_string();
     let affected = {
-        let mut affected = vec![parent_rel(&from)];
-        let to_parent = parent_rel(&to);
+        let mut affected = vec![parent_of_abs(&from_s)];
+        let to_parent = parent_of_abs(&to_s);
         if to_parent != affected[0] {
             affected.push(to_parent);
         }
         affected
     };
-    let result =
-        tokio::task::spawn_blocking(move || fs::rename_path(&root, &from, &to)).await;
+    let result = tokio::task::spawn_blocking(move || fs::rename_path(&from, &to)).await;
     match result {
         Ok(Ok(())) => {
             broadcast_after_mutation(&state, affected);
             (StatusCode::OK, Json(MutateResponse { ok: true })).into_response()
         }
-        Ok(Err(fs::FsError::EscapedRoot)) => (
-            StatusCode::BAD_REQUEST,
-            Json(MutateResponse { ok: false }),
-        )
-            .into_response(),
+        Ok(Err(fs::FsError::InvalidInput(msg))) => {
+            tracing::warn!("rename rejected: {msg}");
+            (StatusCode::BAD_REQUEST, Json(MutateResponse { ok: false })).into_response()
+        }
         Ok(Err(fs::FsError::Io(e))) => {
             tracing::warn!("rename failed: {e}");
             (
@@ -267,21 +355,19 @@ pub async fn delete_handler(
     State(state): State<AppState>,
     Json(body): Json<MutateRequest>,
 ) -> Response {
-    let root = state.root_marker.clone();
-    let path = body.path.clone();
-    let affected_parent = parent_rel(&path);
-    let result =
-        tokio::task::spawn_blocking(move || fs::delete_path(&root, &path)).await;
+    let path = resolve_path(&body.path, &state.root_marker);
+    let path_s = path.display().to_string();
+    let affected_parent = parent_of_abs(&path_s);
+    let result = tokio::task::spawn_blocking(move || fs::delete_path(&path)).await;
     match result {
         Ok(Ok(())) => {
             broadcast_after_mutation(&state, vec![affected_parent]);
             (StatusCode::OK, Json(MutateResponse { ok: true })).into_response()
         }
-        Ok(Err(fs::FsError::EscapedRoot)) => (
-            StatusCode::BAD_REQUEST,
-            Json(MutateResponse { ok: false }),
-        )
-            .into_response(),
+        Ok(Err(fs::FsError::InvalidInput(msg))) => {
+            tracing::warn!("delete rejected: {msg}");
+            (StatusCode::BAD_REQUEST, Json(MutateResponse { ok: false })).into_response()
+        }
         Ok(Err(fs::FsError::Io(e))) => {
             tracing::warn!("delete failed: {e}");
             (
@@ -301,9 +387,13 @@ pub async fn delete_handler(
     }
 }
 
-/// Upgrades a connection to the change-hint channel. The socket is
-/// push-only: the server relays every `ChangeHint` broadcast as JSON.
-pub async fn update_hint_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+/// Upgrades a connection to the change-hint channel. Besides relaying server
+/// hints it accepts `{type:"watch", path}` messages that tell the watcher
+/// which directory to follow (the currently viewed folder).
+pub async fn update_hint_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     ws.on_upgrade(move |socket| hint_socket(socket, state))
 }
 
@@ -327,6 +417,16 @@ async fn hint_socket(mut socket: WebSocket, state: AppState) {
             }
             incoming = socket.recv() => {
                 match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        let s: &str = &text;
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
+                            if value.get("type").and_then(|t| t.as_str()) == Some("watch") {
+                                if let Some(p) = value.get("path").and_then(|p| p.as_str()) {
+                                    let _ = state.watch_tx.send(PathBuf::from(p));
+                                }
+                            }
+                        }
+                    }
                     Some(Ok(_)) => {}
                     _ => break,
                 }
@@ -335,10 +435,16 @@ async fn hint_socket(mut socket: WebSocket, state: AppState) {
     }
 }
 
-/// Watches the root recursively and broadcasts change hints, batching events
-/// through a short debounce so directory churn (builds, target/) collapses
-/// into a single hint per affected directory.
-fn spawn_watcher(root: PathBuf, tx: broadcast::Sender<ChangeHint>) {
+/// Watches whichever directory the frontend is viewing and broadcasts change
+/// hints, batching events through a short debounce so directory churn
+/// collapses into a single hint per affected directory. The frontend swaps the
+/// watched directory over the WebSocket; when nothing tells it otherwise, the
+/// initial root is watched.
+fn spawn_watcher(
+    initial: PathBuf,
+    mut watch_rx: mpsc::UnboundedReceiver<PathBuf>,
+    tx: broadcast::Sender<ChangeHint>,
+) {
     tokio::spawn(async move {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut watcher = match notify::recommended_watcher(
@@ -354,36 +460,38 @@ fn spawn_watcher(root: PathBuf, tx: broadcast::Sender<ChangeHint>) {
                 return;
             }
         };
-        if let Err(e) = watcher.watch(&root, notify::RecursiveMode::Recursive) {
-            tracing::warn!("failed to watch root {}: {e}", root.display());
-            return;
-        }
-        tracing::info!("watching {} for changes", root.display());
+        let mut watched: Option<PathBuf> = None;
+        set_watch(&mut watcher, &mut watched, initial);
 
+        let mut pending: BTreeSet<String> = BTreeSet::new();
         loop {
-            let Some(ev) = event_rx.recv().await else { break; };
-            let mut pending: BTreeSet<String> = BTreeSet::new();
-            absorb(&ev, &root, &mut pending);
-
-            loop {
-                let deadline = tokio::time::sleep(std::time::Duration::from_millis(
-                    WATCH_DEBOUNCE_MS,
-                ));
-                tokio::pin!(deadline);
-                tokio::select! {
-                    ev = event_rx.recv() => {
-                        match ev {
-                            Some(ev) => absorb(&ev, &root, &mut pending),
-                            None => break,
+            tokio::select! {
+                ev = event_rx.recv() => {
+                    match ev {
+                        Some(ev) => absorb(&ev, &mut pending, watched.as_deref()),
+                        None => return,
+                    }
+                    loop {
+                        let deadline = tokio::time::sleep(std::time::Duration::from_millis(WATCH_DEBOUNCE_MS));
+                        tokio::pin!(deadline);
+                        tokio::select! {
+                            ev = event_rx.recv() => {
+                                match ev {
+                                    Some(ev) => absorb(&ev, &mut pending, watched.as_deref()),
+                                    None => return,
+                                }
+                            }
+                            _ = &mut deadline => {
+                                flush(&mut pending, &tx);
+                                break;
+                            }
                         }
                     }
-                    _ = &mut deadline => {
-                        let flushed: Vec<String> = pending.iter().cloned().collect();
-                        pending.clear();
-                        for dir in flushed {
-                            let _ = tx.send(ChangeHint::changed(dir));
-                        }
-                        break;
+                }
+                w = watch_rx.recv() => {
+                    match w {
+                        Some(dir) => set_watch(&mut watcher, &mut watched, dir),
+                        None => return,
                     }
                 }
             }
@@ -391,16 +499,77 @@ fn spawn_watcher(root: PathBuf, tx: broadcast::Sender<ChangeHint>) {
     });
 }
 
-fn absorb(ev: &notify::Event, root: &Path, pending: &mut BTreeSet<String>) {
+fn set_watch(
+    watcher: &mut notify::RecommendedWatcher,
+    watched: &mut Option<PathBuf>,
+    dir: PathBuf,
+) {
+    let dir = normalize_dir(dir);
+    if watched.as_deref() == Some(dir.as_path()) {
+        return;
+    }
+    if let Some(prev) = watched.take() {
+        let _ = watcher.unwatch(&prev);
+    }
+    let dir_s = dir.display().to_string();
+    if let Some(mode) = watch_mode_for(&dir) {
+        match watcher.watch(&dir, mode) {
+            Ok(()) => {
+                *watched = Some(dir);
+                tracing::info!("watching {dir_s} for changes");
+            }
+            Err(e) => {
+                tracing::warn!("failed to watch {dir_s}: {e}");
+            }
+        }
+    } else {
+        *watched = Some(dir);
+        tracing::info!("not watching pseudo-filesystem {dir_s}");
+    }
+}
+
+fn normalize_dir(dir: PathBuf) -> PathBuf {
+    let mut s = dir.display().to_string();
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    PathBuf::from(s)
+}
+
+fn watch_mode_for(dir: &Path) -> Option<notify::RecursiveMode> {
+    if dir == Path::new("/") {
+        return Some(notify::RecursiveMode::NonRecursive);
+    }
+    let name = dir.file_name().and_then(|n| n.to_str());
+    let is_system_pseudo = dir.parent() == Some(Path::new("/"))
+        && matches!(name, Some("proc") | Some("sys") | Some("dev"));
+    if is_system_pseudo {
+        return None;
+    }
+    Some(notify::RecursiveMode::Recursive)
+}
+
+fn flush(pending: &mut BTreeSet<String>, tx: &broadcast::Sender<ChangeHint>) {
+    for dir in pending.iter() {
+        let _ = tx.send(ChangeHint::changed(dir.clone()));
+    }
+    pending.clear();
+}
+
+fn absorb(ev: &notify::Event, pending: &mut BTreeSet<String>, watched: Option<&Path>) {
     use notify::EventKind;
     match ev.kind {
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any => {}
         _ => return,
     }
+    let Some(watched) = watched else {
+        return;
+    };
+    let watched_s = watched.to_string_lossy().replace('\\', "/");
     for p in &ev.paths {
-        if let Ok(rel) = p.strip_prefix(root) {
-            let rel = rel.to_string_lossy().replace('\\', "/");
-            pending.insert(parent_rel(&rel));
+        let s = p.to_string_lossy().replace('\\', "/");
+        if parent_of_abs(&s) == watched_s {
+            pending.insert(watched_s.clone());
         }
     }
 }
@@ -409,6 +578,7 @@ fn absorb(ev: &notify::Event, root: &Path, pending: &mut BTreeSet<String>) {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/info", get(info_json))
+        .route("/icons/{theme}/{*path}", get(icon_handler))
         .route("/filetree", get(filetree_handler))
         .route("/filecontent", get(filecontent_handler))
         .route("/filesearch", get(filesearch_handler))
@@ -435,7 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn info_reports_root() {
+    async fn info_reports_root_and_home() {
         let dir = tempfile::tempdir().unwrap();
         let response = app_for(dir.path())
             .oneshot(Request::builder().uri("/info").body(Body::empty()).unwrap())
@@ -447,6 +617,7 @@ mod tests {
             .unwrap();
         let info: Info = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(info.root, dir.path().display().to_string());
+        assert_eq!(info.home, std::env::var("HOME").unwrap_or_default());
     }
 
     #[tokio::test]
@@ -455,6 +626,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src/sub")).unwrap();
         std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let root_s = dir.path().display().to_string();
 
         let router = app_for(dir.path());
 
@@ -468,53 +640,193 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
         let entries: Vec<fs::FileTreeEntry> = serde_json::from_slice(&bytes).unwrap();
-        let paths: Vec<(&str, bool)> =
-            entries.iter().map(|e| (e.path.as_str(), e.is_dir)).collect();
-        assert!(paths.contains(&("Cargo.toml", false)), "got: {paths:?}");
-        assert!(paths.contains(&("src", true)), "got: {paths:?}");
-        assert_eq!(paths.len(), 2);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"src"), "got: {names:?}");
+        assert!(names.contains(&"Cargo.toml"), "got: {names:?}");
+        assert_eq!(names.len(), 2);
+        assert!(entries.iter().any(|e| e.is_dir && e.path == format!("{root_s}/src")));
+        assert!(entries
+            .iter()
+            .any(|e| !e.is_dir && e.path == format!("{root_s}/Cargo.toml")));
 
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/filetree?path=src")
+                    .uri(format!("/filetree?path={root_s}/src"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .unwrap();
         let entries: Vec<fs::FileTreeEntry> = serde_json::from_slice(&bytes).unwrap();
-        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(
-            paths.contains(&"src/sub") && paths.contains(&"src/main.rs"),
-            "got: {paths:?}"
+            names.contains(&"sub") && names.contains(&"main.rs"),
+            "got: {names:?}"
         );
-        assert!(entries[0].is_dir, "dirs must come first: {paths:?}");
+        assert!(entries[0].is_dir, "dirs must come first: {names:?}");
     }
 
     #[tokio::test]
-    async fn filetree_rejects_traversal() {
+    async fn filetree_404_for_missing_path_and_400_for_files() {
         let dir = tempfile::tempdir().unwrap();
-        let response = app_for(dir.path())
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let root_s = dir.path().display().to_string();
+        let router = app_for(dir.path());
+
+        let response = router
+            .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/filetree?path=../etc")
+                    .uri(format!("/filetree?path={root_s}/nope"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/filetree?path={root_s}/f.txt"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        let entries: Vec<fs::FileTreeEntry> = serde_json::from_slice(&bytes).unwrap();
-        assert!(entries.is_empty());
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+#[tokio::test]
+    async fn icon_serves_theme_files_and_blocks_traversal() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let theme_root = dir.path().join("res").join("icons");
+        std::fs::create_dir_all(theme_root.join("test-theme/mimetypes/96")).unwrap();
+        let mut file = std::fs::File::create(theme_root.join("test-theme/mimetypes/96/x.svg")).unwrap();
+        file.write_all(b"<svg></svg>").unwrap();
+
+        let state = AppState::new(dir.path().to_path_buf());
+        let mut state = state;
+        // point themes_dir at the temp tree
+        state.themes_dir = theme_root;
+        let router = build_router(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/icons/test-theme/mimetypes/96/x.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"<svg></svg>");
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/icons/test-theme/../../../../etc/passwd")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/icons/../other/thing.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/icons/test-theme/mimetypes/96/missing.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+#[test]
+    fn parent_of_abs_reduces_to_parent_dir() {
+        assert_eq!(parent_of_abs("/etc/x"), "/etc");
+        assert_eq!(parent_of_abs("/etc/"), "/");
+        assert_eq!(parent_of_abs("/etc"), "/");
+        assert_eq!(parent_of_abs("/"), "/");
+        assert_eq!(parent_of_abs("/a/b/c"), "/a/b");
+    }
+
+    #[test]
+    fn absorb_only_keeps_events_in_watched_dir() {
+        fn ev(path: &str) -> notify::Event {
+            notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(std::path::PathBuf::from(path))
+        }
+        let root = Path::new("/home/u/watchdir");
+        let mut pending = BTreeSet::new();
+
+        // direct child change -> hint for the watched dir
+        absorb(&ev("/home/u/watchdir/a.txt"), &mut pending, Some(root));
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains("/home/u/watchdir"));
+
+        // deep change under a subdir -> ignored (parent != watched dir)
+        absorb(
+            &ev("/home/u/watchdir/sub/b.txt"),
+            &mut pending,
+            Some(root),
+        );
+        assert_eq!(pending.len(), 1, "deep events must not surface");
+
+        // change outside the watched dir -> ignored
+        absorb(&ev("/home/u/other/c.txt"), &mut pending, Some(root));
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn watch_mode_skips_noise_dirs() {
+        assert_eq!(
+            watch_mode_for(Path::new("/")),
+            Some(notify::RecursiveMode::NonRecursive)
+        );
+        assert_eq!(watch_mode_for(Path::new("/proc")), None);
+        assert_eq!(watch_mode_for(Path::new("/sys")), None);
+        assert_eq!(watch_mode_for(Path::new("/dev")), None);
+        assert_eq!(
+            watch_mode_for(Path::new("/home/u")),
+            Some(notify::RecursiveMode::Recursive)
+        );
+        // a regular "proc" folder elsewhere still gets watched
+        assert_eq!(
+            watch_mode_for(Path::new("/home/u/proc")),
+            Some(notify::RecursiveMode::Recursive)
+        );
     }
 }

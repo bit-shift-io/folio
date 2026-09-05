@@ -8,21 +8,22 @@
 </head>
 <body>
   <header id="topbar">
-    <code id="root-label"></code>
     <input id="file-filter" type="text" placeholder="Filter files...">
+    <input id="path-input" type="text" spellcheck="false" autocomplete="off" placeholder="/" aria-label="Path">
     <button id="refresh-btn" type="button" title="Refresh">&#8635;</button>
   </header>
   <main id="layout">
     <section class="file-browser">
       <div class="file-tree-pane">
         <div class="file-tree" id="file-tree"></div>
+      </div>
+      <div class="file-list-pane">
+        <div class="file-list" id="file-list"></div>
         <div class="file-tree-status muted" id="files-subtitle"></div>
       </div>
       <div class="file-preview">
         <div class="preview-header" id="preview-header"></div>
-        <div class="preview-content" id="preview-content">
-          <p class="muted">Select a file to preview</p>
-        </div>
+        <div class="preview-content" id="preview-content"></div>
       </div>
     </section>
   </main>

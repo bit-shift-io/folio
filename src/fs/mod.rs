@@ -1,19 +1,21 @@
-//! Filesystem core for the browser: listing, search, preview, and safe path
-//! joining. Every function takes the server's root directory plus a
-//! caller-supplied relative path and never follows a path that could escape
-//! the root (`safe_join` rejects absolute paths and `..` components).
+//! Filesystem core for the browser: listing, search, preview, and mutations.
+//! All functions operate on absolute paths; `--root` on the CLI only sets the
+//! initial directory the browser opens on, it is not a confinement boundary.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// One node in the file browser tree. The tree is returned flat with `depth`
-/// so the client can indent without building a nested structure.
+/// One node in the file browser. `path` is an absolute path; `depth` is always
+/// `0` from the server (the client layouts rows itself).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileTreeEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
     pub depth: usize,
+    /// MIME type for icon selection: extension tables, or a magic-byte sniff
+    /// for extensionless files. Directories report `inode/directory`.
+    pub mime: String,
 }
 
 /// Payload for a single file's preview contents.
@@ -30,8 +32,8 @@ pub struct FileContent {
     pub error: String,
 }
 
-/// Directories skipped when walking the tree and when searching. Kept in one
-/// place so `list_dir` and `search_files` always agree on what to hide.
+/// Directory names skipped by *search* (a performance guard for the recursive
+/// walk). Directory listing shows everything — this is a full file browser.
 pub const SKIP_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -43,6 +45,10 @@ pub const SKIP_DIRS: &[&str] = &[
     ".vscode",
     ".DS_Store",
 ];
+
+/// Pseudo-filesystem roots that recursive search never enters. Only applied
+/// when the search base is `/` itself, so normal trees are never affected.
+pub const PSEUDO_ROOTS: &[&str] = &["proc", "sys", "dev", "run"];
 
 /// Extensions treated as renderable text by the preview pane.
 pub const TEXT_EXTS: &[&str] = &[
@@ -61,33 +67,38 @@ pub const IMAGE_EXTS: &[&str] = &[
     "tif", "psd", "ai", "eps",
 ];
 
-/// Joins a caller-supplied relative path onto `root`, refusing absolute paths
-/// and `..` traversal components. Returns None when unsafe so handlers can
-/// reject the request before touching the filesystem.
-pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
-    let rel_path = Path::new(rel);
-    if rel_path.is_absolute()
-        || rel_path
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
-    {
-        return None;
-    }
-    Some(root.join(rel_path))
+/// Errors while listing a directory, split so handlers can map them to status
+/// codes (404 for missing paths, 400 for non-directories).
+#[derive(Debug)]
+pub enum ListError {
+    NotFound,
+    NotADirectory,
+    Io(io::Error),
 }
 
-/// Errors from mutating operations, split so handlers can distinguish a
-/// rejected path (bad request) from an actual filesystem failure.
+impl std::fmt::Display for ListError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ListError::NotFound => write!(f, "no such directory"),
+            ListError::NotADirectory => write!(f, "not a directory"),
+            ListError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ListError {}
+
+/// Errors from mutating operations.
 #[derive(Debug)]
 pub enum FsError {
-    EscapedRoot,
+    InvalidInput(String),
     Io(io::Error),
 }
 
 impl std::fmt::Display for FsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FsError::EscapedRoot => write!(f, "path escapes the root directory"),
+            FsError::InvalidInput(m) => write!(f, "{m}"),
             FsError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -95,43 +106,55 @@ impl std::fmt::Display for FsError {
 
 impl std::error::Error for FsError {}
 
-/// Lists the immediate children of a directory inside the root. Empty `dir`
-/// means the root itself. `SKIP_DIRS` are hidden so navigation stays fast and
-/// focused. Directories are returned first, then files, each alphabetically.
-pub fn list_dir(root: &Path, dir: &str) -> Vec<FileTreeEntry> {
-    let Some(base) = safe_join(root, dir) else {
-        return Vec::new();
-    };
+impl From<io::Error> for FsError {
+    fn from(e: io::Error) -> Self {
+        FsError::Io(e)
+    }
+}
 
-    let Ok(read) = std::fs::read_dir(&base) else {
-        return Vec::new();
-    };
+fn invalid(msg: &str) -> FsError {
+    FsError::InvalidInput(msg.to_string())
+}
 
+/// Lists the immediate children of an absolute directory. Directories come
+/// first, then files, each alphabetically. Symlinks are followed for
+/// classification so a link to a folder behaves like a folder and a link to a
+/// file like a file; permission failures yield `Io`.
+pub fn list_dir(dir: &Path) -> Result<Vec<FileTreeEntry>, ListError> {
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => ListError::NotFound,
+        _ => ListError::Io(e),
+    })?;
+    if !meta.is_dir() {
+        return Err(ListError::NotADirectory);
+    }
+
+    let read = std::fs::read_dir(dir).map_err(ListError::Io)?;
     let mut entries = Vec::new();
     for item in read.flatten() {
         let name = item.file_name().to_string_lossy().into_owned();
-        if SKIP_DIRS.contains(&name.as_str()) {
-            continue;
-        }
-        let rel = if dir.is_empty() {
-            name.clone()
-        } else {
-            format!("{dir}/{name}")
+        let ft = match item.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
         };
-        match item.file_type() {
-            Ok(ft) if ft.is_dir() => entries.push(FileTreeEntry {
+        let is_dir = if ft.is_symlink() {
+            std::fs::metadata(item.path()).map(|m| m.is_dir()).unwrap_or(false)
+        } else {
+            ft.is_dir()
+        };
+        if is_dir || ft.is_file() || ft.is_symlink() {
+            let mime = if is_dir {
+                "inode/directory".to_string()
+            } else {
+                mime_for_entry(&dir.join(&name), &name)
+            };
+            entries.push(FileTreeEntry {
+                path: dir.join(&name).display().to_string(),
                 name,
-                path: rel,
-                is_dir: true,
+                is_dir,
                 depth: 0,
-            }),
-            Ok(ft) if ft.is_file() => entries.push(FileTreeEntry {
-                name,
-                path: rel,
-                is_dir: false,
-                depth: 0,
-            }),
-            _ => {}
+                mime,
+            });
         }
     }
 
@@ -140,23 +163,20 @@ pub fn list_dir(root: &Path, dir: &str) -> Vec<FileTreeEntry> {
             .cmp(&a.is_dir)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    entries
+    Ok(entries)
 }
 
-/// Recursively searches the root for files whose path contains `query`
-/// (case-insensitive substring match). Returns at most `limit` results,
-/// skipping the same directories as `list_dir`.
-pub fn search_files(root: &Path, query: &str, limit: usize) -> Vec<FileTreeEntry> {
+/// Recursively searches `base` for files whose path contains `query`
+/// (case-insensitive substring match). Returns at most `limit` results with
+/// absolute paths, skipping `SKIP_DIRS` and, when the base is `/`, the
+/// pseudo-filesystem roots.
+pub fn search_files(base: &Path, query: &str, limit: usize) -> Vec<FileTreeEntry> {
     let q = query.to_lowercase();
+    let skip_pseudofs = base == Path::new("/");
     let mut results = Vec::new();
-    let mut stack = vec![String::new()];
+    let mut stack = vec![base.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let base = if dir.is_empty() {
-            root.to_path_buf()
-        } else {
-            root.join(&dir)
-        };
-        let Ok(read) = std::fs::read_dir(&base) else {
+        let Ok(read) = std::fs::read_dir(&dir) else {
             continue;
         };
         let mut children = Vec::new();
@@ -165,29 +185,33 @@ pub fn search_files(root: &Path, query: &str, limit: usize) -> Vec<FileTreeEntry
             if SKIP_DIRS.contains(&name.as_str()) {
                 continue;
             }
-            let rel = if dir.is_empty() {
-                name.clone()
-            } else {
-                format!("{dir}/{name}")
-            };
+            if skip_pseudofs && dir == *base && PSEUDO_ROOTS.contains(&name.as_str()) {
+                continue;
+            }
             match item.file_type() {
-                Ok(ft) if ft.is_dir() => children.push((name, rel, true)),
-                Ok(ft) if ft.is_file() => children.push((name, rel, false)),
+                Ok(ft) if ft.is_dir() => children.push((name, true)),
+                Ok(ft) if ft.is_file() => children.push((name, false)),
                 _ => {}
             }
         }
-        children.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
-        for (name, rel, is_dir) in children {
+        children.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        });
+        for (name, is_dir) in children {
+            let full = dir.join(&name);
             if is_dir {
-                stack.push(rel);
-            } else if rel.to_lowercase().contains(&q) {
+                stack.push(full);
+            } else if name.to_lowercase().contains(&q) {
+                let mime = mime_for_entry(&full, &name);
                 results.push(FileTreeEntry {
                     name,
-                    path: rel,
+                    path: full.display().to_string(),
                     is_dir: false,
                     depth: 0,
+                    mime,
                 });
                 if results.len() >= limit {
+                    results.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
                     return results;
                 }
             }
@@ -227,53 +251,93 @@ pub fn mime_for_path(path: &str) -> &'static str {
     }
 }
 
-/// Image extensions render inline in the preview pane. Driven by the shared
-/// `IMAGE_EXTS` list so preview behavior stays aligned with `mime_for_path`.
+/// Image extensions render inline in the preview pane.
 pub fn is_image_path(path: &str) -> bool {
     mime_for_path(path).starts_with("image/")
+}
+
+/// MIME type used for icon selection in listings. Extension-backed types reuse
+/// `mime_for_path`; extensionless files fall back to a magic-byte sniff so a
+/// bare `configure`, `run`, or `app` still gets a meaningful icon.
+pub fn mime_for_entry(path: &Path, name: &str) -> String {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !ext.is_empty() {
+        return mime_for_path(name).to_string();
+    }
+    sniff_mime(path)
+}
+
+fn sniff_mime(path: &Path) -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    let n = match std::fs::File::open(path).and_then(|mut f| f.read(&mut buf)) {
+        Ok(n) => n,
+        Err(_) => return "text/plain".to_string(),
+    };
+    let head = &buf[..n];
+    let (_, rest) = head.split_first().unwrap();
+    if head.starts_with(&[0x7f, b'E', b'L', b'F']) {
+        "application/x-executable"
+    } else if head.starts_with(b"#!") {
+        "text/x-script"
+    } else if head.starts_with(&[0x50, 0x4b, 0x03, 0x04]) {
+        "application/zip"
+    } else if head.starts_with(&[0x1f, 0x8b]) {
+        "application/gzip"
+    } else if head.starts_with(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]) {
+        "application/x-7z-compressed"
+    } else if head.starts_with(&[0x42, 0x5a, 0x68]) {
+        "application/x-bzip2"
+    } else if head.starts_with(b"%PDF") {
+        "application/pdf"
+    } else if head.starts_with(&[0x89]) && rest.starts_with(b"PNG") {
+        "image/png"
+    } else if head.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else if head.starts_with(b"GIF8") {
+        "image/gif"
+    } else {
+        "text/plain"
+    }
+    .to_string()
 }
 
 /// Reads a file for the preview pane, detecting binary contents and image
 /// files. Errors are folded into the payload's `error` field so the handler
 /// can return a 200 with a graceful client-side message.
-pub fn get_file_content(root: &Path, path: &str) -> FileContent {
-    let Some(full) = safe_join(root, path) else {
-        return FileContent {
-            path: path.to_string(),
-            size: 0,
-            is_binary: false,
-            is_image: false,
-            content: String::new(),
-            error: "path escapes the root directory".to_string(),
-        };
-    };
-    let meta = match std::fs::metadata(&full) {
+pub fn get_file_content(path: &Path) -> FileContent {
+    let path_str = path.display().to_string();
+    let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) => {
             return FileContent {
-                path: path.to_string(),
+                path: path_str.clone(),
                 size: 0,
                 is_binary: false,
                 is_image: false,
                 content: String::new(),
-                error: format!("failed to read {path}: {e}"),
+                error: format!("failed to read {path_str}: {e}"),
             }
         }
     };
-    let bytes = match std::fs::read(&full) {
+    let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
             return FileContent {
-                path: path.to_string(),
+                path: path_str.clone(),
                 size: 0,
                 is_binary: false,
                 is_image: false,
                 content: String::new(),
-                error: format!("failed to read {path}: {e}"),
+                error: format!("failed to read {path_str}: {e}"),
             }
         }
     };
-    let is_image = is_image_path(path);
+    let is_image = is_image_path(&path_str);
     let is_binary = !is_image && bytes.contains(&0u8);
     let content = if is_binary || is_image {
         String::new()
@@ -281,7 +345,7 @@ pub fn get_file_content(root: &Path, path: &str) -> FileContent {
         String::from_utf8_lossy(&bytes).into_owned()
     };
     FileContent {
-        path: path.to_string(),
+        path: path_str,
         size: meta.len(),
         is_binary,
         is_image,
@@ -290,39 +354,32 @@ pub fn get_file_content(root: &Path, path: &str) -> FileContent {
     }
 }
 
-fn io_error(msg: String) -> FsError {
-    FsError::Io(io::Error::new(io::ErrorKind::InvalidInput, msg))
-}
-
-/// Deletes a file or directory (recursively) inside the root. Symlinks are
-/// removed as links, never followed.
-pub fn delete_path(root: &Path, rel: &str) -> Result<(), FsError> {
-    if rel.is_empty() {
-        return Err(io_error("cannot delete the root directory".into()));
+/// Deletes a file or directory (recursively) at an absolute path. Symlinks are
+/// removed as links, never followed. Refuses to delete the filesystem root.
+pub fn delete_path(path: &Path) -> Result<(), FsError> {
+    if path == Path::new("/") {
+        return Err(invalid("cannot delete the root directory"));
     }
-    let full = safe_join(root, rel).ok_or(FsError::EscapedRoot)?;
-    let meta = std::fs::symlink_metadata(&full).map_err(FsError::Io)?;
+    let meta = std::fs::symlink_metadata(path).map_err(FsError::Io)?;
     if meta.file_type().is_symlink() {
-        std::fs::remove_file(&full).map_err(FsError::Io)
+        std::fs::remove_file(path).map_err(FsError::Io)
     } else if meta.is_dir() {
-        std::fs::remove_dir_all(&full).map_err(FsError::Io)
+        std::fs::remove_dir_all(path).map_err(FsError::Io)
     } else {
-        std::fs::remove_file(&full).map_err(FsError::Io)
+        std::fs::remove_file(path).map_err(FsError::Io)
     }
 }
 
-/// Renames (or moves) a file or directory from one relative path to another,
-/// both inside the root.
-pub fn rename_path(root: &Path, from: &str, to: &str) -> Result<(), FsError> {
-    if from.is_empty() {
-        return Err(io_error("cannot rename the root directory".into()));
+/// Renames (or moves) a file or directory between two absolute paths. Refuses
+/// to rename the filesystem root.
+pub fn rename_path(from: &Path, to: &Path) -> Result<(), FsError> {
+    if from == Path::new("/") {
+        return Err(invalid("cannot rename the root directory"));
     }
-    if to.is_empty() {
-        return Err(io_error("rename target may not be empty".into()));
+    if to.as_os_str().is_empty() {
+        return Err(invalid("rename target may not be empty"));
     }
-    let src = safe_join(root, from).ok_or(FsError::EscapedRoot)?;
-    let dst = safe_join(root, to).ok_or(FsError::EscapedRoot)?;
-    std::fs::rename(&src, &dst).map_err(FsError::Io)
+    std::fs::rename(from, to).map_err(FsError::Io)
 }
 
 #[cfg(test)]
@@ -330,27 +387,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn safe_join_rejects_traversal_and_absolute_paths() {
-        let root = Path::new("/srv");
-        assert_eq!(
-            safe_join(root, "a/b.txt"),
-            Some(PathBuf::from("/srv/a/b.txt"))
-        );
-        assert_eq!(safe_join(root, ""), Some(PathBuf::from("/srv")));
-        assert!(safe_join(root, "../etc/passwd").is_none());
-        assert!(safe_join(root, "a/../../etc/passwd").is_none());
-        assert!(safe_join(root, "/etc/passwd").is_none());
+    fn mime_fields_classify_extensionless_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("script"), "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(dir.path().join("blob"), [0x7f, b'E', b'L', b'F', 2, 1, 1, 0]).unwrap();
+        std::fs::write(dir.path().join("plain"), "just text\n").unwrap();
+        std::fs::write(dir.path().join("notes.md"), "# hi\n").unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        let entries = list_dir(dir.path()).unwrap();
+        let by_name = |n: &str| entries.iter().find(|e| e.name == n).unwrap();
+        assert_eq!(by_name("script").mime, "text/x-script");
+        assert_eq!(by_name("blob").mime, "application/x-executable");
+        assert_eq!(by_name("plain").mime, "text/plain");
+        assert_eq!(by_name("notes.md").mime, "text/plain");
+        assert_eq!(by_name("subdir").mime, "inode/directory");
     }
 
     #[test]
-    fn list_dir_returns_dirs_first_then_files() {
+    fn list_dir_returns_dirs_first_then_files_absolute() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("b.txt"), "x").unwrap();
         std::fs::write(dir.path().join("a.txt"), "x").unwrap();
         std::fs::create_dir(dir.path().join("zdir")).unwrap();
         std::fs::create_dir(dir.path().join("adir")).unwrap();
 
-        let entries = list_dir(dir.path(), "");
+        let entries = list_dir(dir.path()).unwrap();
         assert!(
             entries[0].is_dir && entries[1].is_dir && !entries[2].is_dir,
             "dirs must sort before files: {entries:?}"
@@ -359,34 +421,57 @@ mod tests {
         assert_eq!(entries[1].name, "zdir");
         assert_eq!(entries[2].name, "a.txt");
         assert_eq!(entries[3].name, "b.txt");
+
+        let root_s = dir.path().display().to_string();
+        assert_eq!(entries[0].path, format!("{root_s}/adir"));
+        assert_eq!(entries[2].path, format!("{root_s}/a.txt"));
     }
 
     #[test]
-    fn list_dir_hides_skip_dirs_and_filters_relative_paths() {
+    fn list_dir_shows_everything_including_junk_dirs() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("node_modules")).unwrap();
         std::fs::create_dir(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
-        std::fs::write(dir.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
 
-        let root = list_dir(dir.path(), "");
-        let names: Vec<&str> = root.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"src"));
-        assert!(!names.contains(&"node_modules"), "got: {names:?}");
-
-        let sub = list_dir(dir.path(), "src");
-        let paths: Vec<&str> = sub.iter().map(|e| e.path.as_str()).collect();
+        let names: Vec<String> = list_dir(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"src".to_string()));
         assert!(
-            paths.contains(&"src/main.rs") && paths.contains(&"src/lib.rs"),
-            "got: {paths:?}"
+            names.contains(&"node_modules".to_string()),
+            "a full browser must not hide dirs: {names:?}"
         );
     }
 
     #[test]
-    fn list_dir_traversal_returns_empty() {
+    fn list_dir_errors_for_missing_and_non_dir() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(list_dir(dir.path(), "../etc").is_empty());
-        assert!(list_dir(dir.path(), "/etc").is_empty());
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+
+        assert!(matches!(
+            list_dir(&dir.path().join("nope")),
+            Err(ListError::NotFound)
+        ));
+        assert!(matches!(
+            list_dir(&dir.path().join("f.txt")),
+            Err(ListError::NotADirectory)
+        ));
+    }
+
+    #[test]
+    fn list_dir_follows_dir_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let entries = list_dir(dir.path()).unwrap();
+        let link_entry = entries.iter().find(|e| e.name == "link").unwrap();
+        assert!(link_entry.is_dir, "symlink to a dir must show as a dir");
     }
 
     #[test]
@@ -397,18 +482,23 @@ mod tests {
         std::fs::write(dir.path().join("README.MD"), "# Hello\n").unwrap();
         std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
         std::fs::write(dir.path().join("src/sub/lib.rs"), "pub fn f() {}\n").unwrap();
+        let root_s = dir.path().display().to_string();
 
         let results = search_files(dir.path(), "READme", 200);
         let paths: Vec<&str> = results.iter().map(|e| e.path.as_str()).collect();
-        assert!(paths.contains(&"README.MD"), "got: {paths:?}");
+        assert!(
+            paths.contains(&format!("{root_s}/README.MD").as_str()),
+            "got: {paths:?}"
+        );
 
         let rs = search_files(dir.path(), ".rs", 200);
         let rs_paths: Vec<&str> = rs.iter().map(|e| e.path.as_str()).collect();
         assert!(
-            rs_paths.contains(&"src/main.rs") && rs_paths.contains(&"src/sub/lib.rs"),
+            rs_paths.contains(&format!("{root_s}/src/main.rs").as_str())
+                && rs_paths.contains(&format!("{root_s}/src/sub/lib.rs").as_str()),
             "got: {rs_paths:?}"
         );
-        assert!(!rs_paths.contains(&"Cargo.toml"));
+        assert!(!rs_paths.contains(&format!("{root_s}/Cargo.toml").as_str()));
     }
 
     #[test]
@@ -436,12 +526,12 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "hello world\n").unwrap();
         std::fs::write(dir.path().join("b.bin"), [0u8, 1, 2, 0, 4]).unwrap();
 
-        let text = get_file_content(dir.path(), "a.txt");
+        let text = get_file_content(&dir.path().join("a.txt"));
         assert_eq!(text.content, "hello world\n");
         assert!(!text.is_binary && !text.is_image);
         assert_eq!(text.size, 12);
 
-        let bin = get_file_content(dir.path(), "b.bin");
+        let bin = get_file_content(&dir.path().join("b.bin"));
         assert!(bin.is_binary);
         assert_eq!(bin.content, "");
     }
@@ -449,11 +539,8 @@ mod tests {
     #[test]
     fn get_file_content_reports_errors_inline() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = get_file_content(dir.path(), "nope.txt");
+        let missing = get_file_content(&dir.path().join("nope.txt"));
         assert!(!missing.error.is_empty());
-
-        let traversal = get_file_content(dir.path(), "../secret.txt");
-        assert_eq!(traversal.error, "path escapes the root directory");
     }
 
     #[test]
@@ -463,37 +550,32 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("d/sub")).unwrap();
         std::fs::write(dir.path().join("d/sub/f.txt"), "x").unwrap();
 
-        delete_path(dir.path(), "a.txt").unwrap();
+        delete_path(&dir.path().join("a.txt")).unwrap();
         assert!(!dir.path().join("a.txt").exists());
 
-        delete_path(dir.path(), "d").unwrap();
+        delete_path(&dir.path().join("d")).unwrap();
         assert!(!dir.path().join("d").exists());
     }
 
     #[test]
-    fn delete_rejects_root_and_traversal() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(delete_path(dir.path(), "").is_err());
-        assert!(matches!(delete_path(dir.path(), "../x"), Err(FsError::EscapedRoot)));
+    fn delete_rejects_fs_root() {
+        assert!(delete_path(Path::new("/")).is_err());
     }
 
     #[test]
-    fn rename_moves_and_rejects_escape() {
+    fn rename_moves_and_rejects() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("a.txt"), "x").unwrap();
 
-        rename_path(dir.path(), "a.txt", "sub/b.txt").unwrap();
+        rename_path(&dir.path().join("a.txt"), &dir.path().join("sub/b.txt")).unwrap();
         assert!(dir.path().join("sub/b.txt").exists());
         assert!(!dir.path().join("a.txt").exists());
 
         assert!(matches!(
-            rename_path(dir.path(), "sub/b.txt", "../escape.txt"),
-            Err(FsError::EscapedRoot)
+            rename_path(&dir.path().join("sub/b.txt"), &dir.path().join("nope/x.txt")),
+            Err(FsError::Io(_))
         ));
-        assert!(matches!(
-            rename_path(dir.path(), "../out", "x.txt"),
-            Err(FsError::EscapedRoot)
-        ));
+        assert!(matches!(rename_path(Path::new("/"), Path::new("/x")), Err(FsError::InvalidInput(_))));
     }
 }

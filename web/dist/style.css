@@ -30,12 +30,21 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
-#root-label {
-  color: var(--text-muted);
+#path-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 13px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+}
+
+#path-input:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 
 #file-filter {
@@ -62,11 +71,12 @@ body {
 
 .file-browser {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 312px 224px 1fr;
   height: 100%;
 }
 
-.file-tree-pane {
+.file-tree-pane,
+.file-list-pane {
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
@@ -74,6 +84,13 @@ body {
 }
 
 .file-tree {
+  flex: 1;
+  overflow: auto;
+  padding: 6px 0;
+  font-size: 13px;
+}
+
+.file-list {
   flex: 1;
   overflow: auto;
   padding: 6px 0;
@@ -99,6 +116,18 @@ body {
 .tree-item:hover { background: var(--bg-hover); }
 
 .tree-item.selected { background: var(--bg-hover); color: var(--accent); }
+
+.tree-item.current { color: var(--accent); background: var(--bg-hover); }
+
+.pane-active { box-shadow: inset 0 0 0 1px var(--accent); }
+
+.tree-toggle {
+  width: 14px;
+  text-align: center;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  user-select: none;
+}
 
 .tree-icon {
   width: 16px;
@@ -200,4 +229,45 @@ body {
 
 #dropdown .dropdown-menu button.danger {
   color: #f08888;
+}
+
+.icon-grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  --icon: 80px;
+  --name: 16px;
+  --gap: 13px;
+  gap: var(--gap);
+}
+
+.grid-item {
+  width: calc(var(--icon) + 24px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 6px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+  text-align: center;
+}
+
+.grid-item:hover { background: var(--bg-hover); }
+
+.grid-icon {
+  width: var(--icon);
+  height: var(--icon);
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+.grid-name {
+  font-size: var(--name);
+  line-height: 1.2;
+  color: var(--text);
+  max-width: calc(var(--icon) + 24px);
+  overflow-wrap: anywhere;
 }

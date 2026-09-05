@@ -1,7 +1,9 @@
 //! Folio: a fast, single-binary local web file explorer.
 //!
-//! Serves one directory over plain HTTP on `127.0.0.1`, with a tiny
-//! WebSocket channel that pushes change hints when the filesystem moves.
+//! Serves the filesystem over plain HTTP on `127.0.0.1`, starting at one
+//! directory, with a tiny WebSocket channel that pushes change hints when the
+//! filesystem moves. Browsing is unrestricted — `..` and the path bar reach
+//! anywhere a shell can.
 
 use std::path::PathBuf;
 
@@ -12,12 +14,12 @@ use folio::server;
 #[derive(Parser)]
 #[command(name = "folio", about = "Local web file explorer")]
 struct Cli {
-    /// Root directory to browse (default: current directory)
+    /// Initial directory to browse (default: current directory)
     #[arg(long, default_value = ".")]
     root: PathBuf,
 
     /// Port to bind on 127.0.0.1
-    #[arg(long, default_value_t = 8080)]
+    #[arg(long, default_value_t = 4000)]
     port: u16,
 }
 
