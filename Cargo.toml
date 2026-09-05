@@ -1,0 +1,31 @@
+[package]
+name = "folio"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, single-binary local web file explorer"
+license = "MIT"
+
+[[bin]]
+name = "folio"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws", "tokio", "http1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+notify = "8"
+rust-embed = { version = "8", features = ["mime-guess"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tower = { version = "0.5", features = ["util"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = "0.30"
+reqwest = { version = "0.12", default-features = false }
+
+[profile.release]
+opt-level = 3

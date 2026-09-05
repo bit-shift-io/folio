@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>folio</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header id="topbar">
+    <code id="root-label"></code>
+    <input id="file-filter" type="text" placeholder="Filter files...">
+    <button id="refresh-btn" type="button" title="Refresh">&#8635;</button>
+  </header>
+  <main id="layout">
+    <section class="file-browser">
+      <div class="file-tree-pane">
+        <div class="file-tree" id="file-tree"></div>
+        <div class="file-tree-status muted" id="files-subtitle"></div>
+      </div>
+      <div class="file-preview">
+        <div class="preview-header" id="preview-header"></div>
+        <div class="preview-content" id="preview-content">
+          <p class="muted">Select a file to preview</p>
+        </div>
+      </div>
+    </section>
+  </main>
+  <div id="dropdown"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
