@@ -7,10 +7,12 @@
 //! comes from a `.desktop` file on disk and is parsed per the freedesktop
 //! spec (field codes substituted, quoting respected).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
+use freedesktop_desktop_entry::DesktopEntry;
 
 /// One installed application as surfaced to the dropdown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,75 +74,67 @@ fn app_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// Raw fields of one `.desktop` file, before usability filtering.
-#[derive(Default)]
-struct Fields {
-    id: String,
-    type_: String,
-    name: String,
-    exec: String,
-    try_exec: Option<String>,
-    icon: String,
-    hidden: bool,
-    no_display: bool,
-    terminal: bool,
-    mime_types: Vec<String>,
-}
-
-fn read_fields(path: &Path) -> Option<Fields> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let mut f = Fields {
-        id: path.display().to_string(),
-        ..Fields::default()
-    };
-    let mut in_main = false;
-    for raw in content.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') {
-            in_main = line == "[Desktop Entry]";
-            continue;
-        }
-        if !in_main {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim();
-        match key {
-            "Type" => f.type_ = value.to_string(),
-            "Name" => {
-                if f.name.is_empty() {
-                    f.name = value.to_string();
-                }
-            }
-            "Exec" => f.exec = value.to_string(),
-            "TryExec" => f.try_exec = Some(value.to_string()),
-            "Icon" => f.icon = value.to_string(),
-            "Hidden" => f.hidden = value == "true",
-            "NoDisplay" => f.no_display = value == "true",
-            "Terminal" => f.terminal = value == "true",
-            "MimeType" => {
-                f.mime_types.extend(
-                    value
-                        .split(';')
-                        .map(str::trim)
-                        .filter(|m| !m.is_empty())
-                        .map(str::to_string),
-                );
-            }
-            _ => {}
-        }
-    }
-    Some(f)
-}
-
-fn is_flatpak(exec: &str) -> bool {
-    exec.starts_with("flatpak run")
-}
+// TODO: Replace Fields struct and read_fields function with freedesktop-desktop-entry
+//#[derive(Default)]
+//struct Fields {
+//    id: String,
+//    type_: String,
+//    name: String,
+//    exec: String,
+//    try_exec: Option<String>,
+//    icon: String,
+//    hidden: bool,
+//    no_display: bool,
+//    terminal: bool,
+//    mime_types: Vec<String>,
+//
+//fn read_fields(path: &Path) -> Option<Fields> {
+//    let content = std::fs::read_to_string(path).ok()?;
+//    let mut f = Fields {
+//        id: path.display().to_string(),
+//        ..Fields::default()
+//    };
+//    let mut in_main = false;
+//    for raw in content.lines() {
+//        let line = raw.trim();
+//        if line.is_empty() || line.starts_with('#') {
+//            continue;
+//        }
+//        if line.starts_with('[') {
+//            in_main = line == "[Desktop Entry]";
+//            continue;
+//        }
+//        if !in_main {
+//            continue;
+//        }
+//        let Some((key, value)) = line.split_once('=') else {
+//            continue;
+//        };
+//        let value = value.trim();
+//        match key {
+//            "Type" => f.type_ = value.to_string(),
+//            "Name" => {
+//                if f.name.is_empty() {
+//                    f.name = value.to_string();
+//                }
+//            }
+//            "Exec" => f.exec = value.to_string(),
+//            "TryExec" => f.try_exec = Some(value.to_string()),
+//            "Icon" => f.icon = value.to_string(),
+//            "Hidden" => f.hidden = value == "true",
+//            "NoDisplay" => f.no_display = value == "true",
+//            "Terminal" => f.terminal = value == "true",
+//            "MimeType" => {
+//                f.mime_types.extend(
+//                    value
+//                        .split(';')
+//                        .map(str::trim)
+//                        .filter(|m| !m.is_empty())
+//                        .map(str::to_string),
+////                );
+//            }
+//            _ => {}
+//        }
 
 fn resolvable(token: &str) -> bool {
     if token.contains('/') {
@@ -159,7 +153,10 @@ fn find_in_path(program: &str) -> Option<PathBuf> {
 /// Enumerates installed applications: `Type=Application`, visible, non-
 /// terminal, with a launchable command. Sorted by name for a stable dropdown.
 pub fn list_apps() -> Vec<AppEntry> {
-    let mut apps = Vec::new();
+    let mut apps: Vec<AppEntry> = Vec::new();
+    let mut by_appid: HashMap<String, usize> = HashMap::new();
+    let mut helpers: Vec<std::path::PathBuf> = Vec::new();
+
     for dir in app_dirs() {
         let Ok(read) = std::fs::read_dir(&dir) else {
             continue;
@@ -169,43 +166,75 @@ pub fn list_apps() -> Vec<AppEntry> {
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
                 continue;
             }
-            let Some(fields) = read_fields(&path) else {
+            let Ok(de) = DesktopEntry::from_path(&path, None as Option<&[String]>) else {
                 continue;
             };
-            if fields.type_ != "Application"
-                || fields.hidden
-                || fields.no_display
-                || fields.terminal
-                || fields.exec.trim().is_empty()
-                || is_flatpak(&fields.exec)
+            if de.type_() != Some("Application")
+                || de.hidden()
+                || de.terminal()
+                || de.exec().as_deref().map_or(true, |e| e.trim().is_empty())
+                || de.exec().unwrap_or_default().starts_with("flatpak run")
             {
                 continue;
+            };
+
+            if de.no_display() {
+                if de.desktop_entry("X-KDE-AliasFor").is_some() {
+                    helpers.push(path);
+                }
+                continue;
             }
-            let Some(first) = split_exec(&fields.exec).into_iter().next() else {
+
+            let Some(first) = split_exec(&de.exec().unwrap_or_default()).into_iter().next() else {
                 continue;
             };
-            let available = match &fields.try_exec {
+            let available = match de.try_exec() {
                 Some(t) => resolvable(t),
                 None => resolvable(&first),
             };
             if !available {
                 continue;
             }
-            let name = if fields.name.is_empty() {
+            let name = if de.name(&[] as &[String]).as_deref().map_or(true, |n| n.is_empty()) {
                 path.file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
                     .to_string()
             } else {
-                fields.name
+                de.name(&[] as &[String]).unwrap().to_string()
             };
+            let mime_types: Vec<String> = de.mime_type().unwrap_or_default().into_iter().map(|s| s.to_string()).filter(|s| !s.is_empty()).collect();
+            by_appid.insert(de.appid.clone(), apps.len());
             apps.push(AppEntry {
-                id: fields.id,
+                id: path.display().to_string(),
                 name,
-                mime_types: fields.mime_types,
+                mime_types,
             });
         }
     }
+
+    for path in helpers {
+        let Ok(de) = DesktopEntry::from_path(&path, None as Option<&[String]>) else {
+            continue;
+        };
+        let Some(alias) = de.desktop_entry("X-KDE-AliasFor") else {
+            continue;
+        };
+        let alias_appid = alias.trim().strip_suffix(".desktop").unwrap_or(alias.trim());
+        if alias_appid.is_empty() {
+            continue;
+        }
+        let Some(&idx) = by_appid.get(alias_appid) else {
+            continue;
+        };
+        for m in de.mime_type().unwrap_or_default() {
+            let m = m.to_string();
+            if !m.is_empty() && !apps[idx].mime_types.contains(&m) {
+                apps[idx].mime_types.push(m);
+            }
+        }
+    }
+
     apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     apps
 }
@@ -332,20 +361,21 @@ pub fn open_with(id: &str, target: &Path) -> Result<(), LaunchError> {
     if std::fs::symlink_metadata(target).is_err() {
         return Err(LaunchError::MissingTarget(target.display().to_string()));
     }
-    let fields = read_fields(Path::new(id)).ok_or_else(|| LaunchError::NoExec(id.to_string()))?;
-    if fields.exec.trim().is_empty() {
+    let desktop_entry = DesktopEntry::from_path(Path::new(id), None as Option<&[String]>).map_err(|_| LaunchError::NoExec(id.to_string()))?;
+    if desktop_entry.exec().as_deref().map_or(true, |e| e.trim().is_empty()) {
         return Err(LaunchError::NoExec(id.to_string()));
     }
     let (mut argv, used_file) = expand_exec(
-        split_exec(&fields.exec),
-        &fields.name,
-        &fields.icon,
-        &fields.id,
+        split_exec(&desktop_entry.exec().unwrap_or_default()),
+        &desktop_entry.name(&[] as &[String]).unwrap(),
+        &desktop_entry.icon().unwrap_or_default(),
+        id,
         target,
     );
     if argv.is_empty() {
         return Err(LaunchError::NoExec(id.to_string()));
     }
+    // Append target path if no file code was found in Exec line
     if !used_file {
         argv.push(target.display().to_string());
     }
@@ -439,6 +469,63 @@ mod tests {
                     && a.name != "Not An App"
                     && a.name != "No Exec"),
             "filtered entries leaked: {apps:?}"
+        );
+    }
+
+    #[test]
+    fn list_apps_merges_kde_alias_helpers_into_main_entry() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let apps_dir = dir.path().join("applications");
+        std::fs::create_dir_all(&apps_dir).unwrap();
+        std::fs::write(
+            apps_dir.join("org.example.myapp.desktop"),
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=My App\n\
+             Exec=/bin/true\n\
+             TryExec=/bin/true\n\
+             MimeType=application/x-myapp;\n",
+        ).unwrap();
+        std::fs::write(
+            apps_dir.join("myapp_png.desktop"),
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=My App\n\
+             Exec=/bin/true %F\n\
+             TryExec=/bin/true\n\
+             NoDisplay=true\n\
+             X-KDE-AliasFor=org.example.myapp.desktop\n\
+             MimeType=image/png;\n",
+        ).unwrap();
+        std::fs::write(
+            apps_dir.join("myapp_jpeg.desktop"),
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=My App\n\
+             Exec=/bin/true %F\n\
+             NoDisplay=true\n\
+             X-KDE-AliasFor=org.example.myapp.desktop\n\
+             MimeType=image/jpeg;\n",
+        ).unwrap();
+
+        let old = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+        let apps = list_apps();
+        match old {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+
+        let myapp = apps.iter().find(|a| a.name == "My App")
+            .expect("my app present");
+        assert!(myapp.mime_types.contains(&"application/x-myapp".to_string()));
+        assert!(myapp.mime_types.contains(&"image/png".to_string()));
+        assert!(myapp.mime_types.contains(&"image/jpeg".to_string()));
+        assert_eq!(
+            apps.iter().filter(|a| a.name == "My App").count(),
+            1,
+            "alias helpers must not appear as separate entries"
         );
     }
 
