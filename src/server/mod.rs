@@ -4,6 +4,8 @@
 
 pub mod static_files;
 
+use rust_embed::RustEmbed;
+
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -29,6 +31,13 @@ use crate::media;
 const WATCH_DEBOUNCE_MS: u64 = 200;
 /// Search result cap, matching the web UI's single-fetch expectation.
 const SEARCH_LIMIT: usize = 200;
+
+/// Icon themes embedded into the binary so they load in release builds
+/// regardless of the working directory. Served as a fallback when no
+/// matching file is found on disk (themes_dir).
+#[derive(RustEmbed)]
+#[folder = "res/icons"]
+struct IconAssets;
 
 /// A server-pushed change hint. HTTP remains the source of truth; the
 /// WebSocket only tells clients which directory to refetch.
@@ -148,7 +157,20 @@ pub async fn icon_handler(
             ([(header::CONTENT_TYPE, mime)], bytes).into_response()
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            StatusCode::NOT_FOUND.into_response()
+            // Fall back to the copy embedded in the binary, so release
+            // builds work even when launched outside the project dir where
+            // res/icons doesn't exist on disk.
+            match IconAssets::get(&format!("{theme}/{}", rel.display())) {
+                Some(content) => {
+                    let mime = fs::mime_for_path(&format!("{theme}/{}", rel.display()));
+                    (
+                        [(header::CONTENT_TYPE, mime)],
+                        content.data.into_owned(),
+                    )
+                        .into_response()
+                }
+                None => StatusCode::NOT_FOUND.into_response(),
+            }
         }
         Err(e) => {
             tracing::warn!("failed to read {}: {e}", file.display());
@@ -942,6 +964,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+#[tokio::test]
+    async fn icon_falls_back_to_embedded_theme() {
+        // Simulates a release build launched from a directory with no
+        // res/icons on disk: themes_dir points at an empty tree, so the
+        // bundled breeze-dark theme must serve from the embedded copy.
+        let dir = tempfile::tempdir().unwrap();
+        let theme_root = dir.path().join("res").join("icons");
+        std::fs::create_dir_all(&theme_root).unwrap();
+
+        let mut state = AppState::new(dir.path().to_path_buf());
+        state.themes_dir = theme_root;
+        let router = build_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/icons/breeze-dark/places/96/folder.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let header = response.headers().get(header::CONTENT_TYPE).unwrap();
+        assert_eq!(header, "image/svg+xml");
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 64)
+            .await
+            .unwrap();
+        assert!(!bytes.is_empty());
+        assert!(String::from_utf8_lossy(&bytes).contains("<svg"));
     }
 
 #[test]
