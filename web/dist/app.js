@@ -1309,8 +1309,16 @@ async function boot() {
   setActivePane("tree");
 
   const root = await fetchInfo();
-  if (root) {
-    await loadDir(root);
+  const startDir = new URLSearchParams(location.search).get("dir");
+  const initial = startDir || root;
+  if (initial) {
+    // Grit opens folio with ?dir=<repo> as a per-repo start point. When the
+    // target sits outside home, use the full-filesystem tree so the repo is
+    // revealed in the folder tree instead of being unreachable from home.
+    if (!homeDir || !(initial === homeDir || initial.startsWith(homeDir + "/"))) {
+      treeFull = true;
+    }
+    await loadDir(initial);
   } else {
     currentDir = "/";
     setSubtitle("failed to reach the server");
