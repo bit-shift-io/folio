@@ -203,7 +203,12 @@ pub fn list_apps() -> Vec<AppEntry> {
             } else {
                 de.name(&[] as &[String]).unwrap().to_string()
             };
-            let mime_types: Vec<String> = de.mime_type().unwrap_or_default().into_iter().map(|s| s.to_string()).filter(|s| !s.is_empty()).collect();
+            let exec = de.exec().unwrap_or_default();
+            let mut mime_types: Vec<String> =
+                de.mime_type().unwrap_or_default().into_iter().map(|s| s.to_string()).filter(|s| !s.is_empty()).collect();
+            if !mime_types.contains(&"inode/directory".to_string()) && accepts_files_or_urls(&exec) {
+                mime_types.push("inode/directory".to_string());
+            }
             by_appid.insert(de.appid.clone(), apps.len());
             apps.push(AppEntry {
                 id: path.display().to_string(),
@@ -237,6 +242,35 @@ pub fn list_apps() -> Vec<AppEntry> {
 
     apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     apps
+}
+
+/// True when the Exec line carries `%F`/`%U` (or their lowercase forms), the
+/// freedesktop field codes that mean "substitute a file/URL argument here".
+/// Apps that take such arguments can be handed any file URI, including
+/// `file://` URIs for directories, so they are folder-openable even when the
+/// desktop entry's `MimeType` field doesn't list `inode/directory`.
+fn accepts_files_or_urls(exec: &str) -> bool {
+    let bytes = exec.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        if i + 1 >= bytes.len() {
+            break;
+        }
+        if bytes[i + 1] == b'%' {
+            i += 2;
+            continue;
+        }
+        match bytes[i + 1] {
+            b'F' | b'U' | b'f' | b'u' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Tokenizes an Exec line per the freedesktop spec: whitespace-separated,
@@ -461,6 +495,11 @@ mod tests {
             editor.mime_types
         );
         assert!(
+            editor.mime_types.iter().any(|m| m == "inode/directory"),
+            "Exec has %F so inode/directory should be injected; got: {:?}",
+            editor.mime_types
+        );
+        assert!(
             apps
                 .iter()
                 .all(|a| a.name != "Hidden App"
@@ -652,5 +691,107 @@ mod tests {
             Some(v) => std::env::set_var("XDG_DATA_HOME", v),
             None => std::env::remove_var("XDG_DATA_HOME"),
         }
+    }
+
+    #[test]
+    fn accepts_files_or_urls_detects_field_codes() {
+        assert!(accepts_files_or_urls("zed %U"));
+        assert!(accepts_files_or_urls("code --folder-uri %U"));
+        assert!(accepts_files_or_urls("editor %F"));
+        assert!(accepts_files_or_urls("editor %f %f"));
+        assert!(accepts_files_or_urls("editor %u"));
+        assert!(!accepts_files_or_urls("ls %m"));
+        assert!(!accepts_files_or_urls("echo hello"));
+        assert!(!accepts_files_or_urls("%%U"));
+        assert!(!accepts_files_or_urls("100%% done"));
+    }
+
+    #[test]
+    fn list_apps_injects_inode_directory_for_exec_with_file_or_url_codes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let apps_dir = dir.path().join("applications");
+        std::fs::create_dir_all(&apps_dir).unwrap();
+
+        std::fs::write(
+            apps_dir.join("url_editor.desktop"),
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=URL Editor\n\
+             Exec=/bin/true %U\n\
+             MimeType=text/plain;\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            apps_dir.join("file_editor.desktop"),
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=File Editor\n\
+             Exec=/bin/true %F\n\
+             MimeType=text/plain;\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            apps_dir.join("plain.desktop"),
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=Plain App\n\
+             Exec=/bin/true\n\
+             MimeType=text/plain;\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            apps_dir.join("explicit_dir.desktop"),
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=Dir App\n\
+             Exec=/bin/true %U\n\
+             MimeType=inode/directory;text/plain;\n",
+        )
+        .unwrap();
+
+        let old = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+        let apps = list_apps();
+        match old {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+
+        let url_editor = apps.iter().find(|a| a.name == "URL Editor").unwrap();
+        assert!(
+            url_editor.mime_types.contains(&"inode/directory".to_string()),
+            "url_editor: {:?}",
+            url_editor.mime_types
+        );
+
+        let file_editor = apps.iter().find(|a| a.name == "File Editor").unwrap();
+        assert!(
+            file_editor.mime_types.contains(&"inode/directory".to_string()),
+            "file_editor: {:?}",
+            file_editor.mime_types
+        );
+
+        let plain = apps.iter().find(|a| a.name == "Plain App").unwrap();
+        assert!(
+            !plain.mime_types.contains(&"inode/directory".to_string()),
+            "plain should not get inode/directory: {:?}",
+            plain.mime_types
+        );
+
+        let explicit = apps.iter().find(|a| a.name == "Dir App").unwrap();
+        assert_eq!(
+            explicit
+                .mime_types
+                .iter()
+                .filter(|m| *m == "inode/directory")
+                .count(),
+            1,
+            "no duplicate inode/directory: {:?}",
+            explicit.mime_types
+        );
     }
 }

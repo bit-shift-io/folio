@@ -1,6 +1,7 @@
 let pathInput = document.getElementById("path-input");
 let filterInput = document.getElementById("file-filter");
 let refreshBtn = document.getElementById("refresh-btn");
+let folderBtn = document.getElementById("folder-btn");
 let treeEl = document.getElementById("file-tree");
 let listEl = document.getElementById("file-list");
 let subtitleEl = document.getElementById("files-subtitle");
@@ -824,17 +825,47 @@ async function openLastUsed(anchor, path) {
 
 async function openWithMenu(anchor, path) {
   const apps = await getApps();
+    showDropdown(anchor, (menu) => {
+        const matches = apps.filter((a) => appMatchesMime(a, currentFileMime));
+        if (!matches.length) {
+            const none = document.createElement("button");
+            none.textContent = apps.length ? "no app matches this file type" : "no apps found";
+            none.disabled = true;
+            menu.appendChild(none);
+            return;
+        }
+        appendAppGroup(menu, matches, "", path);
+    }, "app-list");
+}
+
+async function openFolderLastUsed(anchor, path) {
+  const apps = await getApps();
+  let id = null;
+  try {
+    const res = await fetch("/defaultapp?mime=" + encodeURIComponent("inode/directory"));
+    if (res.ok) id = (await res.json()).id;
+  } catch {}
+  const app = id && apps.find((a) => a.id === id);
+  if (app) {
+    openWith(app, path);
+  } else {
+    openFolderMenu(anchor, path);
+  }
+}
+
+async function openFolderMenu(anchor, path) {
+  const apps = await getApps();
   showDropdown(anchor, (menu) => {
-    const matches = apps.filter((a) => appMatchesMime(a, currentFileMime));
+    const matches = apps.filter((a) => appMatchesMime(a, "inode/directory"));
     if (!matches.length) {
       const none = document.createElement("button");
-      none.textContent = apps.length ? "no app matches this file type" : "no apps found";
+      none.textContent = apps.length ? "no app matches folder" : "no apps found";
       none.disabled = true;
       menu.appendChild(none);
       return;
     }
     appendAppGroup(menu, matches, "", path);
-  });
+  }, "app-list");
 }
 
 function appendAppGroup(menu, apps, label, path) {
@@ -988,6 +1019,11 @@ refreshBtn.addEventListener("click", () => {
   if (selectedFile) selectFile(selectedFile);
 });
 
+folderBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  openFolderLastUsed(folderBtn, currentDir);
+});
+
 pathInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
     e.preventDefault();
@@ -1016,13 +1052,18 @@ previewContent.addEventListener("wheel", (e) => {
 let dropdownEl = document.getElementById("dropdown");
 let menuAnchor = null;
 
-function showDropdown(anchor, buildFn) {
+function showDropdown(anchor, buildFn, className = "") {
   hideDropdown();
   menuAnchor = anchor;
   dropdownEl.textContent = "";
   const menu = document.createElement("div");
-  menu.className = "dropdown-menu";
+  menu.className = "dropdown-menu" + (className ? " " + className : "");
   buildFn(menu);
+  if (className === "app-list") {
+    const itemCount = menu.querySelectorAll("button").length;
+    const cols = Math.min(4, Math.max(1, Math.ceil(itemCount / 12)));
+    menu.style.setProperty("--cols", cols);
+  }
   dropdownEl.appendChild(menu);
   dropdownEl.style.display = "block";
   positionDropdown(anchor);
