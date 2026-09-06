@@ -18,6 +18,8 @@ use notify::Watcher;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::apps;
+use crate::config;
 use crate::fs;
 
 /// Debounce window for the filesystem watcher: events are batched until this
@@ -57,6 +59,7 @@ pub struct AppState {
     watch_tx: mpsc::UnboundedSender<PathBuf>,
     watch_rx: Arc<std::sync::Mutex<Option<mpsc::UnboundedReceiver<PathBuf>>>>,
     themes_dir: PathBuf,
+    config_path: PathBuf,
 }
 
 impl AppState {
@@ -76,6 +79,7 @@ impl AppState {
             watch_tx,
             watch_rx: Arc::new(std::sync::Mutex::new(Some(watch_rx))),
             themes_dir,
+            config_path: config::config_path().unwrap_or_default(),
         }
     }
 
@@ -250,6 +254,7 @@ pub async fn filecontent_handler(
                 size: 0,
                 is_binary: false,
                 is_image: false,
+                mime: String::new(),
                 content: String::new(),
                 error: format!("task panicked: {e}"),
             })
@@ -385,6 +390,99 @@ pub async fn delete_handler(
                 .into_response()
         }
     }
+}
+
+/// Lists installed desktop applications for the preview pane's "edit"
+/// dropdown. Cellar of truth for `/open`: only apps returned here can be
+/// launched.
+pub async fn apps_handler() -> impl IntoResponse {
+    match tokio::task::spawn_blocking(apps::list_apps).await {
+        Ok(apps) => Json(apps).into_response(),
+        Err(e) => {
+            tracing::warn!("apps discovery panicked: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Vec::<apps::AppEntry>::new()),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct OpenRequest {
+    /// id of an app returned by `/apps` (the `.desktop` file path).
+    id: String,
+    /// Absolute path of the file/folder to open.
+    path: String,
+}
+
+/// Launches an enumerated application with the given path as its argument.
+/// Only ids the server itself discovered are accepted.
+pub async fn open_handler(
+    State(state): State<AppState>,
+    Json(body): Json<OpenRequest>,
+) -> Response {
+    if body.id.trim().is_empty() || body.path.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(MutateResponse { ok: false })).into_response();
+    }
+    let target = resolve_path(&body.path, &state.root_marker);
+    let path_str = target.display().to_string();
+    let mime = fs::mime_for_path(&path_str).to_string();
+    let id = body.id;
+    let config_path = state.config_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        apps::open_with(&id, &target)?;
+        if !config_path.as_os_str().is_empty() {
+            let mut cfg = config::load_from(&config_path);
+            cfg.last_app.insert(mime, id);
+            config::save_to(&config_path, &cfg);
+        }
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(MutateResponse { ok: true })).into_response(),
+        Ok(Err(apps::LaunchError::NotListed(_))) => {
+            (StatusCode::BAD_REQUEST, Json(MutateResponse { ok: false })).into_response()
+        }
+        Ok(Err(apps::LaunchError::MissingTarget(_))) => {
+            (StatusCode::NOT_FOUND, Json(MutateResponse { ok: false })).into_response()
+        }
+        Ok(Err(apps::LaunchError::NoExec(_))) => {
+            (StatusCode::BAD_REQUEST, Json(MutateResponse { ok: false })).into_response()
+        }
+        Ok(Err(apps::LaunchError::Spawn(e))) => {
+            tracing::warn!("open with failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(MutateResponse { ok: false })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("open task panicked: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(MutateResponse { ok: false })).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DefaultAppQuery {
+    /// MIME type to look up; unknown types get no default.
+    #[serde(default)]
+    mime: String,
+}
+
+#[derive(Serialize)]
+pub struct DefaultAppResponse {
+    /// `.desktop` id last used for this MIME type, if any.
+    id: Option<String>,
+}
+
+/// Reports the app chosen most recently for a file type, so the preview's
+/// edit button can launch it directly.
+pub async fn default_app_handler(
+    axum::extract::Query(query): axum::extract::Query<DefaultAppQuery>,
+) -> impl IntoResponse {
+    let id = config::load().last_app.get(&query.mime).cloned();
+    Json(DefaultAppResponse { id })
 }
 
 /// Upgrades a connection to the change-hint channel. Besides relaying server
@@ -582,6 +680,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/filetree", get(filetree_handler))
         .route("/filecontent", get(filecontent_handler))
         .route("/filesearch", get(filesearch_handler))
+        .route("/apps", get(apps_handler))
+        .route("/open", post(open_handler))
+        .route("/defaultapp", get(default_app_handler))
         .route("/ws", get(update_hint_handler))
         .route("/rename", post(rename_handler))
         .route("/delete", post(delete_handler))

@@ -11,22 +11,25 @@ Shared vocabulary for working on this project together.
 
 ## App vocabulary
 
-- **panes** (left → right): folder tree / file list / preview. "First pane" = tree, "second pane" = list. Up/Down move the cursor in the active pane; Right enters/expands a folder, Left goes up a level (parent dir); Tab/Shift+Tab or Ctrl+Left/Right switch panes.
+- **panes** (left → right): folder tree / file list / preview. "First pane" = tree, "second pane" = list. Up/Down move the cursor in the active pane; Right enters/expands a folder in the tree, and on the already-open folder moves to the list pane; Right in the list moves to the preview pane; Left in the list returns to the tree; Left in the preview returns to the list; Left in the tree collapses a folder or goes up a level; Tab/Shift+Tab or Ctrl+Left/Right switch panes.
 - **home view** — the tree opens rooted at the home dir (everything outside home hidden); the `..` row at the top toggles out to the full-filesystem tree.
 - **path bar** (`#path-input`) — the editable location bar; Enter jumps, Escape reverts.
 - **filter box** (`#file-filter`) — filename filter/search from the current dir; results land in the list pane.
 - **icon theme** — served at runtime from `res/icons/<theme>` via `/icons/<theme>/<subdir>/<file>`; current theme `breeze-dark` (`places/96`, `mimetypes/64`, `actions/24`). Theme swap = swap the folder under `res/icons`.
 - **folder view / icon grid** — the preview-pane grid of the open folder; **Ctrl + mouse wheel** zooms 16–160 px (default 80 px).
+- **edit / open-with** — the preview header's ✎ button (with a ▾ caret) launches the file in the app last used for its MIME type; the caret (or first use) opens a dropdown of apps matching the file type. The last-used choice is persisted to `$XDG_CONFIG_HOME/bitshift/folio/config.json` (`/defaultapp` reads it, `/open` updates it). The `⋯` button is the Rename/Delete menu.
+- **text preview** — files render as a line-numbered table (`#preview-content .text-view`), not a raw `<pre>`; the header shows only the basename (full path in the title tooltip).
 - **hints** — WS messages `{type:"changed", path}`. Principle: "HTTP is truth" — hints only trigger a refetch.
 - **dotfiles** — dot-prefixed names are hidden by default; **Ctrl+H** toggles visibility. Non-hidden filtering happens client-side at render time.
 - **watch** — client sends `{type:"watch", path}` so the server watcher follows the viewed dir.
 
 ## Server
 
-- Endpoints: `/info`, `/filetree`, `/filecontent`, `/filesearch`, `/rename` (POST), `/delete` (POST), `/ws`, `/icons/{theme}/{*path}`, embedded static `/`.
+- Endpoints: `/info`, `/filetree`, `/filecontent`, `/filesearch`, `/apps`, `/defaultapp`, `/rename` (POST), `/delete` (POST), `/open` (POST), `/ws`, `/icons/{theme}/{*path}`, embedded static `/`.
 - Paths are **absolute everywhere**; `--root` only sets the starting dir.
 - Mutation codes: 200 ok, 400 invalid, 404 missing, 409 in-use, 500 io.
 - Watching rules: `/` non-recursive, top-level `/proc /sys /dev` skipped, events kept only when the parent is the watched dir.
+- `/apps` lists installed desktop apps (filtered to launchable, non-terminal, visible `Type=Application` entries); `/open` launches **only** an app the server enumerated — Exec parsed per freedesktop spec, target passed as one argv element, detached, never through a shell.
 
 ## Working conventions
 
@@ -34,4 +37,4 @@ Shared vocabulary for working on this project together.
 - Never git init/commit/push unless explicitly asked.
 - Bar: zero compiler warnings; keep unit + integration tests green.
 - No browser/js/node in this dev env — JS is verified by review + curl; the user eyeballs visuals.
-- Security: the `127.0.0.1` binding is the boundary; never shell out from HTTP.
+- Security: the `127.0.0.1` binding is the boundary. Only exception to "no spawning": `/open` may launch a user-picked installed app (verified `.desktop` id, argv built server-side, no shell).

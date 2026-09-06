@@ -26,6 +26,8 @@ pub struct FileContent {
     pub size: u64,
     pub is_binary: bool,
     pub is_image: bool,
+    /// MIME type for the file, used by the "open with" dropdown grouping.
+    pub mime: String,
     /// UTF-8 text content; empty for binary/image files.
     pub content: String,
     /// Non-empty when the read fails so the client can surface it inline.
@@ -222,8 +224,7 @@ pub fn search_files(base: &Path, query: &str, limit: usize) -> Vec<FileTreeEntry
 }
 
 /// Returns the MIME type for a file path based on its extension, reusing the
-/// shared extension tables so `is_image_path`, preview, and raw serving always
-/// agree.
+/// shared extension tables so preview and raw serving always agree.
 pub fn mime_for_path(path: &str) -> &'static str {
     let ext = Path::new(path)
         .extension()
@@ -275,11 +276,6 @@ pub fn mime_for_path(path: &str) -> &'static str {
         e if TEXT_EXTS.contains(&e) => "text/plain",
         _ => "application/octet-stream",
     }
-}
-
-/// Image extensions render inline in the preview pane.
-pub fn is_image_path(path: &str) -> bool {
-    mime_for_path(path).starts_with("image/")
 }
 
 /// MIME type used for icon selection in listings. Extension-backed types reuse
@@ -381,6 +377,7 @@ pub fn get_file_content(path: &Path) -> FileContent {
                 size: 0,
                 is_binary: false,
                 is_image: false,
+                mime: String::new(),
                 content: String::new(),
                 error: format!("failed to read {path_str}: {e}"),
             }
@@ -394,12 +391,18 @@ pub fn get_file_content(path: &Path) -> FileContent {
                 size: 0,
                 is_binary: false,
                 is_image: false,
+                mime: String::new(),
                 content: String::new(),
                 error: format!("failed to read {path_str}: {e}"),
             }
         }
     };
-    let is_image = is_image_path(&path_str);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mime = mime_for_entry(path, &name);
+    let is_image = mime.starts_with("image/");
     let is_binary = !is_image && bytes.contains(&0u8);
     let content = if is_binary || is_image {
         String::new()
@@ -411,6 +414,7 @@ pub fn get_file_content(path: &Path) -> FileContent {
         size: meta.len(),
         is_binary,
         is_image,
+        mime,
         content,
         error: String::new(),
     }
@@ -608,10 +612,12 @@ mod tests {
         assert_eq!(text.content, "hello world\n");
         assert!(!text.is_binary && !text.is_image);
         assert_eq!(text.size, 12);
+        assert_eq!(text.mime, "text/plain");
 
         let bin = get_file_content(&dir.path().join("b.bin"));
         assert!(bin.is_binary);
         assert_eq!(bin.content, "");
+        assert_eq!(bin.mime, "application/octet-stream");
     }
 
     #[test]

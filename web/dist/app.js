@@ -29,6 +29,8 @@ let currentGridEl = null;
 let gridItemCount = 0;
 let gridEntries = [];
 let gridIndex = -1;
+let currentFileMime = "";
+let appsCache = null;
 const GRID_MAX = 10;
 
 const ICON_THEME = "breeze-dark";
@@ -675,20 +677,51 @@ async function selectFile(path) {
   gridIndex = -1;
   previewHeader.textContent = "";
   previewContent.textContent = "";
+  currentFileMime = "";
   try {
     const res = await fetch("/filecontent?path=" + encodeURIComponent(path));
     const data = await res.json();
+    currentFileMime = data.mime || "";
+    const slash = path.lastIndexOf("/");
+    const base = slash < 0 ? path : path.slice(slash + 1);
     const filename = document.createElement("span");
     filename.className = "filename";
-    filename.textContent = path;
+    filename.textContent = base;
+    filename.title = path;
     previewHeader.appendChild(filename);
 
     const spacer = document.createElement("span");
     spacer.className = "header-spacer";
+    previewHeader.appendChild(spacer);
+
+    if (!data.error) {
+      const editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "action-btn open-with";
+      editBtn.textContent = "\u270e";
+      editBtn.title = "Open with the app last used for this file type";
+      editBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openLastUsed(editBtn, path);
+      });
+      previewHeader.appendChild(editBtn);
+
+      const caretBtn = document.createElement("button");
+      caretBtn.type = "button";
+      caretBtn.className = "action-btn caret";
+      caretBtn.textContent = "\u25be";
+      caretBtn.title = "Choose an app\u2026";
+      caretBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openWithMenu(caretBtn, path);
+      });
+      previewHeader.appendChild(caretBtn);
+    }
+
     const menuBtn = document.createElement("button");
     menuBtn.type = "button";
-    menuBtn.className = "header-actions-btn";
-    menuBtn.textContent = "…";
+    menuBtn.className = "action-btn";
+    menuBtn.textContent = "\u22ef";
     menuBtn.title = "Actions";
     menuBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -709,11 +742,11 @@ async function selectFile(path) {
         menu.append(rename, del);
       });
     });
-    previewHeader.append(filename, spacer, menuBtn);
+    previewHeader.appendChild(menuBtn);
 
     const content = document.createElement("div");
-    content.className = "preview-error";
     if (data.error) {
+      content.className = "preview-error";
       content.textContent = data.error;
     } else if (data.is_image) {
       const img = document.createElement("img");
@@ -723,14 +756,107 @@ async function selectFile(path) {
       content.className = "preview-binary";
       content.textContent = "Binary file (" + data.size + " bytes)";
     } else {
-      const pre = document.createElement("pre");
-      pre.textContent = data.content;
-      content.appendChild(pre);
+      const table = document.createElement("table");
+      table.className = "text-view";
+      const lines = data.content.split("\n");
+      if (lines.length && lines[lines.length - 1] === "") lines.pop();
+      for (let i = 0; i < lines.length; i++) {
+        const row = document.createElement("tr");
+        const num = document.createElement("td");
+        num.className = "line-num";
+        num.textContent = String(i + 1);
+        const textCell = document.createElement("td");
+        textCell.className = "line-text";
+        textCell.textContent = lines[i];
+        row.append(num, textCell);
+        table.appendChild(row);
+      }
+      content.appendChild(table);
     }
     previewContent.appendChild(content);
   } catch (e) {
     setSubtitle("failed to load preview");
   }
+}
+
+async function getApps() {
+  if (appsCache) return appsCache;
+  try {
+    const res = await fetch("/apps");
+    appsCache = res.ok ? await res.json() : [];
+  } catch {
+    appsCache = [];
+  }
+  return appsCache;
+}
+
+function appMatchesMime(app, mime) {
+  if (!mime || !app.mime_types) return false;
+  return app.mime_types.some((m) =>
+    m === mime ||
+    (m.endsWith("/*") && mime.startsWith(m.slice(0, m.length - 1)))
+  );
+}
+
+async function openLastUsed(anchor, path) {
+  const apps = await getApps();
+  let id = null;
+  try {
+    const res = await fetch("/defaultapp?mime=" + encodeURIComponent(currentFileMime));
+    if (res.ok) id = (await res.json()).id;
+  } catch {}
+  const app = id && apps.find((a) => a.id === id);
+  if (app) {
+    openWith(app, path);
+  } else {
+    openWithMenu(anchor, path);
+  }
+}
+
+async function openWithMenu(anchor, path) {
+  const apps = await getApps();
+  showDropdown(anchor, (menu) => {
+    const matches = apps.filter((a) => appMatchesMime(a, currentFileMime));
+    if (!matches.length) {
+      const none = document.createElement("button");
+      none.textContent = apps.length ? "no app matches this file type" : "no apps found";
+      none.disabled = true;
+      menu.appendChild(none);
+      return;
+    }
+    appendAppGroup(menu, matches, "", path);
+  });
+}
+
+function appendAppGroup(menu, apps, label, path) {
+  if (!apps.length) return;
+  if (label) {
+    const labelEl = document.createElement("div");
+    labelEl.className = "dropdown-label";
+    labelEl.textContent = label;
+    menu.appendChild(labelEl);
+  }
+  for (const app of apps) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = app.name;
+    btn.title = app.id;
+    btn.addEventListener("click", () => openWith(app, path));
+    menu.appendChild(btn);
+  }
+}
+
+async function openWith(app, path) {
+  hideDropdown();
+  const res = await fetch("/open", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: app.id, path }),
+  });
+  const data = await res.json();
+  setSubtitle(res.ok && data && data.ok
+    ? "opened with " + app.name
+    : (res.status === 404 ? "cannot open: no such file" : "failed to open with " + app.name));
 }
 
 function resetPreview() {
@@ -946,15 +1072,6 @@ function cyclePane(step) {
   setActivePane(order[(idx + step + order.length) % order.length]);
 }
 
-function gridColumns() {
-  const items = currentGridEl ? currentGridEl.children : null;
-  if (!items || items.length < 2) return 1;
-  const top = items[0].getBoundingClientRect().top;
-  let cols = 1;
-  while (cols < items.length && items[cols].getBoundingClientRect().top === top) cols++;
-  return cols;
-}
-
 function applyGridCursor() {
   if (!currentGridEl) return;
   for (let i = 0; i < currentGridEl.children.length; i++) {
@@ -987,20 +1104,8 @@ function moveCursor(step) {
     focusListEntry(i);
     return;
   }
-  if (activePane === "preview" && gridEntries.length) {
-    if (gridIndex < 0) {
-      setGridCursor(step === 1 ? 0 : gridEntries.length - 1);
-      return;
-    }
-    if (step === 1 || step === -1) {
-      setGridCursor((gridIndex + step + gridEntries.length) % gridEntries.length);
-      return;
-    }
-    const cols = gridColumns();
-    let i = gridIndex + step * cols;
-    if (i < 0) i = 0;
-    if (i >= gridEntries.length) i = gridEntries.length - 1;
-    setGridCursor(i);
+  if (activePane === "preview") {
+    previewContent.scrollBy(0, 40 * step);
   }
 }
 
@@ -1013,7 +1118,15 @@ function enterFolder() {
       toggleTreeFull();
       return;
     }
+    if (folder.path === currentDir) {
+      setActivePane("list");
+      return;
+    }
     navigateDir(folder.path);
+    return;
+  }
+  if (activePane === "list") {
+    setActivePane("preview");
     return;
   }
   if (activePane === "preview") {
@@ -1023,7 +1136,7 @@ function enterFolder() {
   }
 }
 
-function goUpLevel() {
+function goLeft() {
   if (activePane === "tree" && treeIndex >= 0) {
     const folder = treeEntries[treeIndex];
     if (folder && folder.pseudo) {
@@ -1035,6 +1148,14 @@ function goUpLevel() {
       renderFolderTree(folder.path);
       return;
     }
+  }
+  if (activePane === "list") {
+    setActivePane("tree");
+    return;
+  }
+  if (activePane === "preview") {
+    setActivePane("list");
+    return;
   }
   if (currentDir === "/") return;
   navigateDir(parentOf(currentDir));
@@ -1073,7 +1194,14 @@ async function boot() {
     }
     if (e.key === "ArrowLeft") {
       e.preventDefault();
-      goUpLevel();
+      goLeft();
+      return;
+    }
+    if (e.key === "PageUp" || e.key === "PageDown") {
+      if (activePane === "preview") {
+        e.preventDefault();
+        previewContent.scrollBy(0, e.key === "PageDown" ? previewContent.clientHeight : -previewContent.clientHeight);
+      }
       return;
     }
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
