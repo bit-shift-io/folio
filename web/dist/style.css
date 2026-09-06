@@ -119,6 +119,8 @@ body {
 
 .tree-item.current { color: var(--accent); background: var(--bg-hover); }
 
+.tree-item.focused { outline: 1px solid var(--accent); outline-offset: -1px; background: var(--bg-hover); }
+
 .pane-active { box-shadow: inset 0 0 0 1px var(--accent); }
 
 .tree-toggle {
@@ -256,6 +258,8 @@ body {
 }
 
 .grid-item:hover { background: var(--bg-hover); }
+
+.grid-item.focused { border-color: var(--accent); background: var(--bg-hover); }
 
 .grid-icon {
   width: var(--icon);

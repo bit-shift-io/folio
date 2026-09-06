@@ -11,12 +11,14 @@ Shared vocabulary for working on this project together.
 
 ## App vocabulary
 
-- **panes** (left → right): folder tree / file list / preview. "First pane" = tree, "second pane" = list. Keyboard arrows navigate the active pane; left/right switch panes.
+- **panes** (left → right): folder tree / file list / preview. "First pane" = tree, "second pane" = list. Up/Down move the cursor in the active pane; Right enters/expands a folder, Left goes up a level (parent dir); Tab/Shift+Tab or Ctrl+Left/Right switch panes.
+- **home view** — the tree opens rooted at the home dir (everything outside home hidden); the `..` row at the top toggles out to the full-filesystem tree.
 - **path bar** (`#path-input`) — the editable location bar; Enter jumps, Escape reverts.
 - **filter box** (`#file-filter`) — filename filter/search from the current dir; results land in the list pane.
 - **icon theme** — served at runtime from `res/icons/<theme>` via `/icons/<theme>/<subdir>/<file>`; current theme `breeze-dark` (`places/96`, `mimetypes/64`, `actions/24`). Theme swap = swap the folder under `res/icons`.
 - **folder view / icon grid** — the preview-pane grid of the open folder; **Ctrl + mouse wheel** zooms 16–160 px (default 80 px).
 - **hints** — WS messages `{type:"changed", path}`. Principle: "HTTP is truth" — hints only trigger a refetch.
+- **dotfiles** — dot-prefixed names are hidden by default; **Ctrl+H** toggles visibility. Non-hidden filtering happens client-side at render time.
 - **watch** — client sends `{type:"watch", path}` so the server watcher follows the viewed dir.
 
 ## Server

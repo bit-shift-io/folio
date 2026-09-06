@@ -16,6 +16,8 @@ let navToken = 0;
 let selectedFile = null;
 let searchResults = [];
 let searchMode = false;
+let showHidden = false;
+let treeFull = false;
 let listEntries = [];
 let listIndex = -1;
 let treeEntries = [];
@@ -25,6 +27,8 @@ let ws = null;
 let gridZoom = 5;
 let currentGridEl = null;
 let gridItemCount = 0;
+let gridEntries = [];
+let gridIndex = -1;
 const GRID_MAX = 10;
 
 const ICON_THEME = "breeze-dark";
@@ -34,6 +38,7 @@ const ICON_FILE_SUBDIR = "mimetypes/64/";
 const ICON_ACTION_SUBDIR = "actions/24/";
 const DEFAULT_FILE_ICON = "text-x-generic.svg";
 const DEFAULT_BINARY_ICON = "application-octet-stream.svg";
+const LOGGED_MISSING_ICONS = new Set();
 
 const FOLDER_SPECIAL = {
   ".git": "folder-git",
@@ -175,25 +180,46 @@ function isImageName(name) {
 /// (notably files with no extension, classified server-side by magic bytes).
 const MIME_ICONS = {
   "application/x-executable": "application-x-executable",
+  "application/x-sharedlib": "application-x-sharedlib",
   "text/x-script": "text-x-script",
   "application/pdf": "application-pdf",
   "application/zip": "application-x-archive",
   "application/gzip": "application-x-archive",
   "application/x-bzip2": "application-x-archive",
+  "application/x-xz": "application-x-archive",
   "application/vnd.rar": "application-x-archive",
   "application/x-tar": "application-x-archive",
   "application/x-7z-compressed": "application-x-7z-compressed",
   "application/x-deb": "application-x-deb",
   "application/x-rpm": "application-x-rpm",
+  "application/java-archive": "application-x-archive",
+  "application/x-iso9660-image": "package-x-generic",
+  "application/json": "application-json",
+  "application/xml": "application-xml",
+  "text/html": "text-html",
+  "application/javascript": "text-javascript",
 };
 
 function iconForMime(mime) {
   if (!mime) return null;
+  const exact = MIME_ICONS[mime];
+  if (exact) return exact;
   if (mime.startsWith("image/")) return "image-x-generic";
   if (mime.startsWith("video/")) return "video-x-generic";
   if (mime.startsWith("audio/")) return "audio-x-generic";
   if (mime.startsWith("text/")) return "text-x-generic";
-  return MIME_ICONS[mime] || null;
+  return null;
+}
+
+function warnMissingIcon(entry, ext) {
+  const key = ext + "\u0000" + (entry.mime || "");
+  if (LOGGED_MISSING_ICONS.has(key)) return;
+  LOGGED_MISSING_ICONS.add(key);
+  console.warn(
+    "no icon for \"" + entry.name +
+    "\" (ext: " + (ext || "none") +
+    ", mime: " + (entry.mime || "none") + ")"
+  );
 }
 
 function iconFileForEntry(entry) {
@@ -210,7 +236,18 @@ function iconFileForEntry(entry) {
   let ext = dot < 0 ? "" : low.slice(dot + 1);
   if (dot === 0 && ext.length > 1) ext = low.slice(1);
   const icon = nameIcon || EXT_ICONS[ext] || iconForMime(entry.mime) || DEFAULT_FILE_ICON;
+  if (icon === DEFAULT_FILE_ICON) warnMissingIcon(entry, ext);
   return ICON_DIR + ICON_FILE_SUBDIR + icon + ".svg";
+}
+
+function onIconError() {
+  if (this.dataset.fallbackIcon) return;
+  this.dataset.fallbackIcon = "1";
+  if (this.src.indexOf(ICON_FOLDER_SUBDIR) !== -1) {
+    this.src = ICON_DIR + ICON_FOLDER_SUBDIR + "folder.svg";
+  } else {
+    this.src = ICON_DIR + ICON_FILE_SUBDIR + DEFAULT_FILE_ICON;
+  }
 }
 
 function iconEl(entry, cls) {
@@ -219,6 +256,7 @@ function iconEl(entry, cls) {
   img.src = iconFileForEntry(entry);
   img.alt = "";
   img.draggable = false;
+  img.addEventListener("error", onIconError);
   return img;
 }
 
@@ -243,6 +281,23 @@ function parentOf(path) {
   const slash = p.lastIndexOf("/");
   if (slash <= 0) return "/";
   return p.slice(0, slash);
+}
+
+function visibleEntry(entry) {
+  return showHidden || !entry.name.startsWith(".");
+}
+
+function refreshView() {
+  if (searchMode) {
+    renderFileList();
+    return;
+  }
+  renderFileList();
+  renderFolderTree();
+  const visible = (dirCache.get(currentDir) || []).filter(visibleEntry);
+  const files = visible.filter((e) => !e.is_dir).length;
+  setSubtitle(visible.length ? files + " files" : "(empty)");
+  if (!selectedFile) showFolderView(currentDir);
 }
 
 function updatePathBar() {
@@ -284,8 +339,9 @@ async function loadDir(dir) {
     if (token !== navToken) return;
     renderFolderTree();
     if (!searchMode) {
-      const files = entries.filter((e) => !e.is_dir).length;
-      setSubtitle(entries.length ? files + " files" : "(empty)");
+      const visible = entries.filter(visibleEntry);
+      const files = visible.filter((e) => !e.is_dir).length;
+      setSubtitle(visible.length ? files + " files" : "(empty)");
       if (!selectedFile) showFolderView(currentDir);
     }
   } catch {
@@ -355,6 +411,7 @@ function gridIconEl(entry) {
     img.src = "/filecontent?path=" + encodeURIComponent(entry.path) + "&raw=true";
   } else {
     img.src = iconFileForEntry(entry);
+    img.addEventListener("error", onIconError);
   }
   return img;
 }
@@ -367,9 +424,11 @@ function applyGridZoom() {
 }
 
 function showFolderView(dir) {
-  const entries = (dirCache.get(dir) || []).slice();
+  const entries = (dirCache.get(dir) || []).filter(visibleEntry);
   gridItemCount = entries.length;
   currentGridEl = null;
+  gridEntries = [];
+  gridIndex = -1;
   previewHeader.textContent = "";
   previewContent.textContent = "";
 
@@ -400,6 +459,7 @@ function showFolderView(dir) {
   const sorted = [...entries].sort((a, b) =>
     (b.is_dir - a.is_dir) || a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
   );
+  gridEntries = sorted;
   for (const entry of sorted) {
     const item = document.createElement("div");
     item.className = "grid-item";
@@ -413,6 +473,7 @@ function showFolderView(dir) {
     grid.appendChild(item);
   }
   previewContent.appendChild(grid);
+  applyGridCursor();
 }
 
 async function revealTree(dir) {
@@ -433,19 +494,19 @@ async function revealTree(dir) {
 async function toggleExpand(dir) {
   if (expandedDirs.has(dir)) {
     expandedDirs.delete(dir);
-    renderFolderTree();
+    renderFolderTree(dir);
     return;
   }
   await getDirEntries(dir);
   expandedDirs.add(dir);
-  renderFolderTree();
+  renderFolderTree(dir);
 }
 
 async function renderTreeNode(dir, depth) {
   const entries = dirCache.get(dir);
   if (!entries) return;
   const folders = entries
-    .filter((e) => e.is_dir)
+    .filter((e) => visibleEntry(e) && e.is_dir)
     .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
   for (const folder of folders) {
     const row = document.createElement("div");
@@ -475,23 +536,63 @@ async function renderTreeNode(dir, depth) {
   }
 }
 
-async function renderFolderTree() {
+async function renderTreeHomeRow() {
+  const row = document.createElement("div");
+  row.className = "tree-item";
+  row.title = treeFull ? "collapse back to home view" : "expand to full filesystem view";
+  const toggle = document.createElement("span");
+  toggle.className = "tree-toggle";
+  toggle.textContent = treeFull ? "▾" : "▸";
+  const img = document.createElement("img");
+  img.className = "tree-icon";
+  img.src = ICON_DIR + ICON_ACTION_SUBDIR + "go-up.svg";
+  img.alt = "";
+  img.draggable = false;
+  img.addEventListener("error", onIconError);
+  const name = document.createElement("span");
+  name.textContent = "..";
+  row.append(toggle, img, name);
+  row.addEventListener("click", () => toggleTreeFull());
+  treeEl.appendChild(row);
+  treeEntries.push({ name: "..", path: null, is_dir: true, pseudo: true });
+}
+
+async function toggleTreeFull() {
+  treeFull = !treeFull;
+  if (homeDir && !dirCache.has(homeDir)) await getDirEntries(homeDir);
+  if (!dirCache.has("/")) await getDirEntries("/");
+  renderFolderTree();
+}
+
+async function renderFolderTree(focusPath) {
   treeEl.textContent = "";
   treeEntries = [];
   treeIndex = -1;
-  if (dirCache.has("/")) {
-    await renderTreeNode("/", 0);
+  await renderTreeHomeRow();
+  if (homeDir && !dirCache.has(homeDir)) {
+    await getDirEntries(homeDir);
   }
-  const current = treeEl.querySelector(".current");
-  if (current) current.scrollIntoView({ block: "center" });
+  const root = homeDir || "/";
+  if (treeFull) {
+    if (dirCache.has("/")) await renderTreeNode("/", 0);
+  } else if (dirCache.has(root)) {
+    await renderTreeNode(root, 0);
+  }
+  const focusTarget = (focusPath && treeEntries.some((f) => f.path === focusPath)) ? focusPath : currentDir;
+  treeIndex = treeEntries.findIndex((f) => f.path === focusTarget);
+  applyTreeCursor();
+  if (treeIndex >= 0) {
+    const row = treeEl.children[treeIndex];
+    if (row) row.scrollIntoView({ block: "center" });
+  }
 }
 
 function renderFileList() {
   listEl.textContent = "";
   if (searchMode) {
-    setSubtitle(searchResults.length ? searchResults.length + " matches" : "No matches");
-    listEntries = searchResults;
-    for (const entry of searchResults) {
+    listEntries = searchResults.filter(visibleEntry);
+    setSubtitle(listEntries.length ? listEntries.length + " matches" : "No matches");
+    for (const entry of listEntries) {
       const row = document.createElement("div");
       row.className = "tree-item" + (selectedFile === entry.path ? " selected" : "");
       const icon = iconEl(entry);
@@ -505,7 +606,7 @@ function renderFileList() {
   } else {
     const entries = dirCache.get(currentDir) || [];
     const files = entries
-      .filter((e) => !e.is_dir)
+      .filter((e) => visibleEntry(e) && !e.is_dir)
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
     listEntries = files;
     for (const entry of files) {
@@ -523,24 +624,28 @@ function renderFileList() {
   listIndex = listEntries.findIndex((e) => e.path === selectedFile);
 }
 
+function applyTreeCursor() {
+  for (let i = 0; i < treeEl.children.length; i++) {
+    treeEl.children[i].classList.toggle("focused", i === treeIndex);
+  }
+}
+
+function setTreeCursor(i) {
+  if (i < 0 || i >= treeEntries.length) return;
+  treeIndex = i;
+  applyTreeCursor();
+  const row = treeEl.children[i];
+  if (row) row.scrollIntoView({ block: "nearest" });
+}
+
 function focusListEntry(i) {
   if (i < 0 || i >= listEntries.length) return;
   listIndex = i;
   const rows = listEl.children;
-  if (rows[i]) {
-    rows[i].scrollIntoView({ block: "nearest" });
-  }
-  selectEntry(listEntries[i]);
-}
-
-function focusTreeEntry(i) {
-  if (i < 0 || i >= treeEntries.length) return;
-  treeIndex = i;
-  const rows = treeEl.children;
-  if (rows[i]) {
-    rows[i].scrollIntoView({ block: "center" });
-  }
-  navigateDir(treeEntries[i].path);
+  for (let j = 0; j < rows.length; j++) rows[j].classList.toggle("selected", j === i);
+  if (rows[i]) rows[i].scrollIntoView({ block: "nearest" });
+  const entry = listEntries[i];
+  if (entry && !entry.is_dir) selectFile(entry.path);
 }
 
 function setActivePane(pane) {
@@ -566,6 +671,8 @@ async function selectFile(path) {
   selectedFile = path;
   renderFileList();
   currentGridEl = null;
+  gridEntries = [];
+  gridIndex = -1;
   previewHeader.textContent = "";
   previewContent.textContent = "";
   try {
@@ -628,6 +735,9 @@ async function selectFile(path) {
 
 function resetPreview() {
   selectedFile = null;
+  currentGridEl = null;
+  gridEntries = [];
+  gridIndex = -1;
   if (searchMode) {
     previewHeader.textContent = "";
     previewContent.textContent = "";
@@ -830,40 +940,152 @@ function connectSocket() {
   ws.onclose = () => setTimeout(connectSocket, 2000);
 }
 
+function cyclePane(step) {
+  const order = ["tree", "list", "preview"];
+  const idx = order.indexOf(activePane);
+  setActivePane(order[(idx + step + order.length) % order.length]);
+}
+
+function gridColumns() {
+  const items = currentGridEl ? currentGridEl.children : null;
+  if (!items || items.length < 2) return 1;
+  const top = items[0].getBoundingClientRect().top;
+  let cols = 1;
+  while (cols < items.length && items[cols].getBoundingClientRect().top === top) cols++;
+  return cols;
+}
+
+function applyGridCursor() {
+  if (!currentGridEl) return;
+  for (let i = 0; i < currentGridEl.children.length; i++) {
+    currentGridEl.children[i].classList.toggle("focused", i === gridIndex);
+  }
+}
+
+function setGridCursor(i) {
+  if (i < 0 || i >= gridEntries.length) return;
+  gridIndex = i;
+  applyGridCursor();
+  const item = currentGridEl && currentGridEl.children[i];
+  if (item) item.scrollIntoView({ block: "nearest" });
+}
+
+function moveCursor(step) {
+  if (activePane === "tree") {
+    if (!treeEntries.length) return;
+    let i = treeIndex < 0 ? (step === 1 ? 0 : treeEntries.length - 1) : treeIndex + step;
+    if (i >= treeEntries.length) i = treeEntries.length - 1;
+    if (i < 0) i = 0;
+    setTreeCursor(i);
+    return;
+  }
+  if (activePane === "list") {
+    if (!listEntries.length) return;
+    let i = listIndex < 0 ? (step === 1 ? 0 : listEntries.length - 1) : listIndex + step;
+    if (i >= listEntries.length) i = listEntries.length - 1;
+    if (i < 0) i = 0;
+    focusListEntry(i);
+    return;
+  }
+  if (activePane === "preview" && gridEntries.length) {
+    if (gridIndex < 0) {
+      setGridCursor(step === 1 ? 0 : gridEntries.length - 1);
+      return;
+    }
+    if (step === 1 || step === -1) {
+      setGridCursor((gridIndex + step + gridEntries.length) % gridEntries.length);
+      return;
+    }
+    const cols = gridColumns();
+    let i = gridIndex + step * cols;
+    if (i < 0) i = 0;
+    if (i >= gridEntries.length) i = gridEntries.length - 1;
+    setGridCursor(i);
+  }
+}
+
+function enterFolder() {
+  if (activePane === "tree") {
+    if (treeIndex < 0) return;
+    const folder = treeEntries[treeIndex];
+    if (!folder) return;
+    if (folder.pseudo) {
+      toggleTreeFull();
+      return;
+    }
+    navigateDir(folder.path);
+    return;
+  }
+  if (activePane === "preview") {
+    if (gridIndex < 0) return;
+    const entry = gridEntries[gridIndex];
+    if (entry && entry.is_dir) navigateDir(entry.path);
+  }
+}
+
+function goUpLevel() {
+  if (activePane === "tree" && treeIndex >= 0) {
+    const folder = treeEntries[treeIndex];
+    if (folder && folder.pseudo) {
+      if (treeFull) toggleTreeFull();
+      return;
+    }
+    if (folder && expandedDirs.has(folder.path)) {
+      expandedDirs.delete(folder.path);
+      renderFolderTree(folder.path);
+      return;
+    }
+  }
+  if (currentDir === "/") return;
+  navigateDir(parentOf(currentDir));
+}
+
 async function boot() {
   document.addEventListener("keydown", (e) => {
     const tag = document.activeElement && document.activeElement.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA") return;
-    if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    if (e.key === "Tab") {
       e.preventDefault();
-      const order = ["tree", "list", "preview"];
-      const idx = order.indexOf(activePane);
-      const next = (idx + (e.key === "ArrowRight" ? 1 : -1) + order.length) % order.length;
-      setActivePane(order[next]);
+      cyclePane(e.shiftKey ? -1 : 1);
+      return;
+    }
+    if (e.ctrlKey && e.key === "ArrowLeft") {
+      e.preventDefault();
+      cyclePane(-1);
+      return;
+    }
+    if (e.ctrlKey && e.key === "ArrowRight") {
+      e.preventDefault();
+      cyclePane(1);
+      return;
+    }
+    if (e.ctrlKey && e.key.toLowerCase() === "h") {
+      e.preventDefault();
+      showHidden = !showHidden;
+      refreshView();
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === "ArrowRight") {
+      e.preventDefault();
+      enterFolder();
+      return;
+    }
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      goUpLevel();
       return;
     }
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
-    const step = e.key === "ArrowDown" ? 1 : -1;
-    if (activePane === "tree") {
-      if (!treeEntries.length) return;
-      e.preventDefault();
-      let i = treeIndex < 0 ? (step === 1 ? 0 : treeEntries.length - 1) : treeIndex + step;
-      if (i >= treeEntries.length) i = treeEntries.length - 1;
-      if (i < 0) i = 0;
-      focusTreeEntry(i);
-      return;
-    }
-    if (activePane === "list") {
-      if (!listEntries.length) return;
-      e.preventDefault();
-      let i = listIndex < 0 ? (step === 1 ? 0 : listEntries.length - 1) : listIndex + step;
-      if (i >= listEntries.length) i = listEntries.length - 1;
-      if (i < 0) i = 0;
-      focusListEntry(i);
-    }
+    e.preventDefault();
+    moveCursor(e.key === "ArrowDown" ? 1 : -1);
   });
 
-  setActivePane("list");
+  document.querySelector(".file-tree-pane").addEventListener("click", () => setActivePane("tree"));
+  document.querySelector(".file-list-pane").addEventListener("click", () => setActivePane("list"));
+  document.querySelector(".file-preview").addEventListener("click", () => setActivePane("preview"));
+
+  setActivePane("tree");
 
   const root = await fetchInfo();
   if (root) {

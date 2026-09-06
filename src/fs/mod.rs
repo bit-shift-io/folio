@@ -230,12 +230,6 @@ pub fn mime_for_path(path: &str) -> &'static str {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
-    if !IMAGE_EXTS.contains(&ext.as_str()) {
-        if TEXT_EXTS.contains(&ext.as_str()) {
-            return "text/plain";
-        }
-        return "application/octet-stream";
-    }
     match ext.as_str() {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -247,6 +241,38 @@ pub fn mime_for_path(path: &str) -> &'static str {
         "avif" => "image/avif",
         "tiff" | "tif" => "image/tiff",
         "psd" => "image/vnd.adobe.photoshop",
+
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "tar" => "application/x-tar",
+        "gz" | "tgz" => "application/gzip",
+        "bz2" => "application/x-bzip2",
+        "xz" => "application/x-xz",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        "deb" => "application/x-deb",
+        "rpm" => "application/x-rpm",
+        "iso" => "application/x-iso9660-image",
+        "jar" => "application/java-archive",
+
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" | "opus" => "application/ogg",
+        "flac" => "audio/flac",
+        "wav" => "audio/x-wav",
+        "aac" => "audio/aac",
+        "m4a" => "audio/mp4",
+        "mid" | "midi" => "audio/midi",
+        "mp4" | "m4v" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
+        "mpg" | "mpeg" => "video/mpeg",
+
+        "exe" => "application/x-executable",
+        "so" | "o" => "application/x-sharedlib",
+
+        e if TEXT_EXTS.contains(&e) => "text/plain",
         _ => "application/octet-stream",
     }
 }
@@ -273,14 +299,32 @@ pub fn mime_for_entry(path: &Path, name: &str) -> String {
 
 fn sniff_mime(path: &Path) -> String {
     use std::io::Read;
-    let mut buf = [0u8; 16];
+    let mut buf = [0u8; 512];
     let n = match std::fs::File::open(path).and_then(|mut f| f.read(&mut buf)) {
         Ok(n) => n,
         Err(_) => return "text/plain".to_string(),
     };
     let head = &buf[..n];
     let (_, rest) = head.split_first().unwrap();
-    if head.starts_with(&[0x7f, b'E', b'L', b'F']) {
+
+    // Textual formats: skip a UTF-8 BOM and leading whitespace before looking
+    // at the first meaningful byte (`{`/`[` = JSON, `<` = markup).
+    let mut i = if head.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
+    while i < head.len() && matches!(head[i], b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c) {
+        i += 1;
+    }
+    let body = &head[i..];
+    let body_low = body.to_ascii_lowercase();
+
+    if body.starts_with(b"{") || body.starts_with(b"[") {
+        "application/json"
+    } else if body_low.starts_with(b"<html") || body_low.starts_with(b"<!doctype html") {
+        "text/html"
+    } else if body.starts_with(b"<?xml") || body.starts_with(b"<") {
+        "application/xml"
+    } else if head.starts_with(&[0x7f, b'E', b'L', b'F']) {
+        "application/x-executable"
+    } else if head.starts_with(b"MZ") {
         "application/x-executable"
     } else if head.starts_with(b"#!") {
         "text/x-script"
@@ -292,6 +336,8 @@ fn sniff_mime(path: &Path) -> String {
         "application/x-7z-compressed"
     } else if head.starts_with(&[0x42, 0x5a, 0x68]) {
         "application/x-bzip2"
+    } else if head.len() >= 262 && &head[257..262] == b"ustar" {
+        "application/x-tar"
     } else if head.starts_with(b"%PDF") {
         "application/pdf"
     } else if head.starts_with(&[0x89]) && rest.starts_with(b"PNG") {
@@ -300,6 +346,22 @@ fn sniff_mime(path: &Path) -> String {
         "image/jpeg"
     } else if head.starts_with(b"GIF8") {
         "image/gif"
+    } else if head.starts_with(b"RIFF") && head.len() >= 12 && &head[8..12] == b"WEBP" {
+        "image/webp"
+    } else if head.starts_with(b"OggS") {
+        "application/ogg"
+    } else if head.starts_with(b"fLaC") {
+        "audio/flac"
+    } else if head.starts_with(b"RIFF") && head.len() >= 12 && &head[8..12] == b"WAVE" {
+        "audio/x-wav"
+    } else if head.starts_with(b"RIFF") && head.len() >= 12 && &head[8..12] == b"AVI " {
+        "video/x-msvideo"
+    } else if head.len() >= 8 && &head[4..8] == b"ftyp" {
+        "video/mp4"
+    } else if head.starts_with(b"ID3") {
+        "audio/mpeg"
+    } else if head.len() >= 2 && head[0] == 0xff && (head[1] & 0xe0) == 0xe0 {
+        "audio/mpeg"
     } else {
         "text/plain"
     }
@@ -402,6 +464,22 @@ mod tests {
         assert_eq!(by_name("plain").mime, "text/plain");
         assert_eq!(by_name("notes.md").mime, "text/plain");
         assert_eq!(by_name("subdir").mime, "inode/directory");
+    }
+
+    #[test]
+    fn mime_fields_sniff_json_xml_and_html() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("project"), "{\n  \"type\": \"project\"\n}\n").unwrap();
+        std::fs::write(dir.path().join("session"), "[ \"a\", \"b\" ]\n").unwrap();
+        std::fs::write(dir.path().join("feed"), "<?xml version=\"1.0\"?>\n<root/>\n").unwrap();
+        std::fs::write(dir.path().join("page"), "<!DOCTYPE html>\n<html></html>\n").unwrap();
+
+        let entries = list_dir(dir.path()).unwrap();
+        let by_name = |n: &str| entries.iter().find(|e| e.name == n).unwrap();
+        assert_eq!(by_name("project").mime, "application/json");
+        assert_eq!(by_name("session").mime, "application/json");
+        assert_eq!(by_name("feed").mime, "application/xml");
+        assert_eq!(by_name("page").mime, "text/html");
     }
 
     #[test]

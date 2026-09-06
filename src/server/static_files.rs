@@ -19,7 +19,14 @@ pub async fn serve_static(uri: Uri) -> Response {
     match Assets::get(path) {
         Some(content) => {
             let mime = content.metadata.mimetype();
-            ([(header::CONTENT_TYPE, mime)], content.data.into_owned()).into_response()
+            (
+                [
+                    (header::CONTENT_TYPE, mime),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                content.data.into_owned(),
+            )
+                .into_response()
         }
         None => (
             axum::http::StatusCode::NOT_FOUND,
