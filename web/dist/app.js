@@ -497,6 +497,9 @@ async function revealTree(dir) {
 async function toggleExpand(dir) {
   if (expandedDirs.has(dir)) {
     expandedDirs.delete(dir);
+    for (const d of [...expandedDirs]) {
+      if (d.startsWith(dir + "/")) expandedDirs.delete(d);
+    }
     renderFolderTree(dir);
     return;
   }
@@ -1238,6 +1241,9 @@ function goLeft() {
     }
     if (folder && expandedDirs.has(folder.path)) {
       expandedDirs.delete(folder.path);
+      for (const d of [...expandedDirs]) {
+        if (d.startsWith(folder.path + "/")) expandedDirs.delete(d);
+      }
       renderFolderTree(folder.path);
       return;
     }

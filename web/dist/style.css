@@ -71,7 +71,7 @@ body {
 
 .file-browser {
   display: grid;
-  grid-template-columns: 312px 224px 1fr;
+  grid-template-columns: 250px 224px 1fr;
   height: 100%;
 }
 
