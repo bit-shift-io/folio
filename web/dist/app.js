@@ -31,6 +31,7 @@ let gridEntries = [];
 let gridIndex = -1;
 let currentFileMime = "";
 let appsCache = null;
+let previewProps = false;
 const GRID_MAX = 10;
 
 const ICON_THEME = "breeze-dark";
@@ -730,6 +731,10 @@ async function selectFile(path) {
         return;
       }
       showDropdown(menuBtn, (menu) => {
+        const props = document.createElement("button");
+        props.type = "button";
+        props.textContent = previewProps ? "Hide properties" : "Properties";
+        props.addEventListener("click", () => toggleProperties(path));
         const rename = document.createElement("button");
         rename.type = "button";
         rename.textContent = "Rename";
@@ -739,7 +744,7 @@ async function selectFile(path) {
         del.textContent = "Delete";
         del.className = "danger";
         del.addEventListener("click", () => deleteFile(path));
-        menu.append(rename, del);
+        menu.append(props, rename, del);
       });
     });
     previewHeader.appendChild(menuBtn);
@@ -774,6 +779,7 @@ async function selectFile(path) {
       content.appendChild(table);
     }
     previewContent.appendChild(content);
+    if (previewProps) await renderProperties(path);
   } catch (e) {
     setSubtitle("failed to load preview");
   }
@@ -859,11 +865,98 @@ async function openWith(app, path) {
     : (res.status === 404 ? "cannot open: no such file" : "failed to open with " + app.name));
 }
 
+async function toggleProperties(path) {
+  previewProps = !previewProps;
+  const el = document.getElementById("file-properties");
+  if (!previewProps) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  el.hidden = false;
+  await renderProperties(path);
+}
+
+async function renderProperties(path) {
+  const el = document.getElementById("file-properties");
+  if (!previewProps || !selectedFile) return;
+  let info = null;
+  try {
+    const res = await fetch("/fileinfo?path=" + encodeURIComponent(path));
+    if (!res.ok) {
+      el.textContent = "failed to load properties";
+      return;
+    }
+    info = await res.json();
+  } catch {
+    el.textContent = "failed to load properties";
+    return;
+  }
+  el.textContent = "";
+  const rows = [
+    ["Name", info.name],
+    ["Path", info.path],
+    ["Type", info.is_dir ? "Folder" : (info.mime || "Unknown")],
+    ["Size", info.is_dir ? "\u2014" : fmtSize(info.size)],
+    ["Modified", new Date(info.modified * 1000).toLocaleString()],
+    ["Permissions", fmtPerms(info.mode)],
+  ];
+  if (info.media) {
+    if (info.media.width && info.media.height) {
+      rows.push(["Dimensions", info.media.width + " \u00d7 " + info.media.height + " px"]);
+    }
+    if (typeof info.media.duration_secs === "number") {
+      rows.push(["Duration", fmtDuration(info.media.duration_secs)]);
+    }
+  }
+  for (const [label, value] of rows) {
+    const labelEl = document.createElement("div");
+    labelEl.className = "prop-label";
+    labelEl.textContent = label;
+    const valueEl = document.createElement("div");
+    valueEl.className = "prop-value";
+    valueEl.textContent = value;
+    el.append(labelEl, valueEl);
+  }
+}
+
+function fmtSize(bytes) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = bytes;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return (i === 0 ? String(v) : v.toFixed(1)) + " " + units[i];
+}
+
+function fmtPerms(mode) {
+  const bits = mode & 0o777;
+  let s = "";
+  for (let i = 6; i >= 0; i -= 3) {
+    const m = (bits >> i) & 7;
+    s += (m & 4 ? "r" : "-") + (m & 2 ? "w" : "-") + (m & 1 ? "x" : "-");
+  }
+  return "0" + bits.toString(8) + " \u2022 " + s;
+}
+
+function fmtDuration(secs) {
+  if (secs < 60) return (secs < 10 ? secs.toFixed(1) : Math.round(secs)) + "s";
+  const m = Math.floor(secs / 60);
+  const s = Math.round(secs % 60);
+  return m + ":" + String(s).padStart(2, "0");
+}
+
 function resetPreview() {
   selectedFile = null;
   currentGridEl = null;
   gridEntries = [];
   gridIndex = -1;
+  previewProps = false;
+  const propsEl = document.getElementById("file-properties");
+  propsEl.hidden = true;
+  propsEl.textContent = "";
   if (searchMode) {
     previewHeader.textContent = "";
     previewContent.textContent = "";

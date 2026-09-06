@@ -21,6 +21,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::apps;
 use crate::config;
 use crate::fs;
+use crate::media;
 
 /// Debounce window for the filesystem watcher: events are batched until this
 /// much quiet time elapses, then one hint is broadcast per affected directory.
@@ -259,6 +260,69 @@ pub async fn filecontent_handler(
                 error: format!("task panicked: {e}"),
             })
             .into_response(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct FileInfoQuery {
+    path: String,
+}
+
+/// Metadata for the file/folder shown in the preview's properties panel,
+/// plus media headers when the file type is one we can parse.
+#[derive(Serialize)]
+pub struct FileInfo {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    pub is_dir: bool,
+    /// Modification time in unix seconds.
+    pub modified: u64,
+    /// Unix permission bits from `MetadataExt::mode`.
+    pub mode: u32,
+    pub mime: String,
+    pub media: Option<media::MediaInfo>,
+}
+
+pub async fn fileinfo_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<FileInfoQuery>,
+) -> Response {
+    let base = resolve_path(&query.path, &state.root_marker);
+    let path_str = base.display().to_string();
+    let result = tokio::task::spawn_blocking(move || -> Option<FileInfo> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&base).ok()?;
+        let is_dir = meta.is_dir();
+        let name = base
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path_str.clone());
+        let mime = if is_dir {
+            "inode/directory".to_string()
+        } else {
+            fs::mime_for_entry(&base, &name).to_string()
+        };
+        let media = if is_dir { None } else { media::probe(&base, &mime) };
+        Some(FileInfo {
+            name,
+            path: path_str,
+            size: meta.len(),
+            is_dir,
+            modified: meta.mtime().max(0) as u64,
+            mode: meta.mode(),
+            mime,
+            media,
+        })
+    })
+    .await;
+    match result {
+        Ok(Some(info)) => Json(info).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(MutateResponse { ok: false })).into_response(),
+        Err(e) => {
+            tracing::warn!("fileinfo task panicked: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(MutateResponse { ok: false })).into_response()
         }
     }
 }
@@ -679,6 +743,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/icons/{theme}/{*path}", get(icon_handler))
         .route("/filetree", get(filetree_handler))
         .route("/filecontent", get(filecontent_handler))
+        .route("/fileinfo", get(fileinfo_handler))
         .route("/filesearch", get(filesearch_handler))
         .route("/apps", get(apps_handler))
         .route("/open", post(open_handler))

@@ -181,6 +181,30 @@ body {
 .preview-error { color: #f08888; }
 .preview-binary { color: var(--text-muted); }
 
+.file-properties {
+  flex: 0 0 auto;
+  max-height: 38%;
+  overflow: auto;
+  border-top: 1px solid var(--border);
+  padding: 8px 14px;
+  font-size: 12px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 14px;
+  align-content: start;
+}
+
+.file-properties[hidden] { display: none; }
+
+.prop-label {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.prop-value {
+  overflow-wrap: anywhere;
+}
+
 .header-spacer { flex: 1; }
 
 .filename {
