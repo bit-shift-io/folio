@@ -14,6 +14,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use tower_http::cors::CorsLayer;
 use notify::Watcher;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
@@ -753,6 +754,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/delete", post(delete_handler))
         .route("/", get(static_files::serve_static))
         .route("/{*path}", get(static_files::serve_static))
+        // Permissive CORS so embedded hosts (e.g. grit's localhost:5000 UI)
+        // can probe, fetch, and WebSocket-upgrade cross-origin.
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
