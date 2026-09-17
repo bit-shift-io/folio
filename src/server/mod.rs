@@ -479,6 +479,159 @@ pub async fn delete_handler(
     }
 }
 
+#[derive(Deserialize)]
+pub struct PasteRequest {
+    /// Absolute source paths (single-entry clipboard in the UI today).
+    sources: Vec<String>,
+    /// Absolute destination directory (the list pane's current folder).
+    dest: String,
+    /// True moves the sources, false copies them.
+    cut: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PasteResponse {
+    ok: bool,
+    /// Final absolute path of the pasted entry (uniquified for copies).
+    path: Option<String>,
+}
+
+/// Why a paste could not complete, mapped to a status code by the handler.
+enum PasteError {
+    BadInput,
+    NotFound,
+    Conflict,
+    Io(std::io::Error),
+}
+
+impl From<fs::FsError> for PasteError {
+    fn from(e: fs::FsError) -> Self {
+        match e {
+            fs::FsError::InvalidInput(_) => PasteError::BadInput,
+            fs::FsError::Io(e) => PasteError::Io(e),
+        }
+    }
+}
+
+/// Copies or moves the clipboard's source paths into a destination directory.
+/// The client holds the clipboard; the server stays stateless. Copies never
+/// overwrite (the destination is uniquified), while cuts refuse collisions.
+pub async fn paste_handler(
+    State(state): State<AppState>,
+    Json(body): Json<PasteRequest>,
+) -> Response {
+    if body.sources.is_empty() || body.dest.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(PasteResponse { ok: false, path: None }),
+        )
+            .into_response();
+    }
+    let dest_dir = resolve_path(&body.dest, &state.root_marker);
+    let sources: Vec<PathBuf> = body
+        .sources
+        .iter()
+        .map(|s| resolve_path(s, &state.root_marker))
+        .collect();
+    if sources.iter().any(|s| s == Path::new("/")) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(PasteResponse { ok: false, path: None }),
+        )
+            .into_response();
+    }
+    let cut = body.cut;
+    let affected = {
+        let mut dirs: Vec<String> = if cut {
+            sources
+                .iter()
+                .map(|s| parent_of_abs(&s.display().to_string()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        dirs.push(dest_dir.display().to_string());
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    };
+    let result = tokio::task::spawn_blocking(move || -> Result<String, PasteError> {
+        match std::fs::metadata(&dest_dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(PasteError::BadInput),
+            Err(_) => return Err(PasteError::NotFound),
+        }
+        let mut last = String::new();
+        for src in &sources {
+            if std::fs::symlink_metadata(src).is_err() {
+                return Err(PasteError::NotFound);
+            }
+            let name = src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or(PasteError::BadInput)?;
+            if cut {
+                let target = dest_dir.join(name);
+                if target.exists() {
+                    return Err(PasteError::Conflict);
+                }
+                fs::move_path(src, &target)?;
+                last = target.display().to_string();
+            } else {
+                let target = fs::unique_copy_dest(&dest_dir, name);
+                fs::copy_path(src, &target)?;
+                last = target.display().to_string();
+            }
+        }
+        Ok(last)
+    })
+    .await;
+    match result {
+        Ok(Ok(path)) => {
+            broadcast_after_mutation(&state, affected);
+            (
+                StatusCode::OK,
+                Json(PasteResponse {
+                    ok: true,
+                    path: Some(path),
+                }),
+            )
+                .into_response()
+        }
+        Ok(Err(PasteError::BadInput)) => (
+            StatusCode::BAD_REQUEST,
+            Json(PasteResponse { ok: false, path: None }),
+        )
+            .into_response(),
+        Ok(Err(PasteError::NotFound)) => (
+            StatusCode::NOT_FOUND,
+            Json(PasteResponse { ok: false, path: None }),
+        )
+            .into_response(),
+        Ok(Err(PasteError::Conflict)) => (
+            StatusCode::CONFLICT,
+            Json(PasteResponse { ok: false, path: None }),
+        )
+            .into_response(),
+        Ok(Err(PasteError::Io(e))) => {
+            tracing::warn!("paste failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PasteResponse { ok: false, path: None }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!("paste task panicked: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PasteResponse { ok: false, path: None }),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Lists installed desktop applications for the preview pane's "edit"
 /// dropdown. Cellar of truth for `/open`: only apps returned here can be
 /// launched.
@@ -774,6 +927,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ws", get(update_hint_handler))
         .route("/rename", post(rename_handler))
         .route("/delete", post(delete_handler))
+        .route("/paste", post(paste_handler))
         .route("/", get(static_files::serve_static))
         .route("/{*path}", get(static_files::serve_static))
         // Permissive CORS so embedded hosts (e.g. grit's localhost:5000 UI)
@@ -1052,5 +1206,200 @@ mod tests {
             watch_mode_for(Path::new("/home/u/proc")),
             Some(notify::RecursiveMode::Recursive)
         );
+    }
+
+    fn paste_request(sources: &[&str], dest: &str, cut: bool) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/paste")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "sources": sources, "dest": dest, "cut": cut })
+                    .to_string(),
+            ))
+            .unwrap()
+    }
+
+    async fn do_paste(
+        router: &Router,
+        sources: &[&str],
+        dest: &str,
+        cut: bool,
+    ) -> (StatusCode, PasteResponse) {
+        let response = router
+            .clone()
+            .oneshot(paste_request(sources, dest, cut))
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: PasteResponse = serde_json::from_slice(&bytes).unwrap();
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn paste_copy_file_keeps_source_and_reports_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        std::fs::write(&src, "hello\n").unwrap();
+        let dest = dir.path().join("dst");
+        std::fs::create_dir(&dest).unwrap();
+        let router = app_for(dir.path());
+
+        let (status, body) = do_paste(
+            &router,
+            &[src.display().to_string().as_str()],
+            &dest.display().to_string(),
+            false,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.ok);
+        let expected = dest.join("a.txt");
+        assert_eq!(body.path.as_deref(), Some(expected.display().to_string().as_str()));
+        assert_eq!(std::fs::read(&expected).unwrap(), b"hello\n");
+        assert!(src.exists(), "copy must leave the source in place");
+    }
+
+    #[tokio::test]
+    async fn paste_copy_collision_returns_uniquified_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        std::fs::write(&src, "new\n").unwrap();
+        let dest = dir.path().join("dst");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("a.txt"), "old\n").unwrap();
+        let router = app_for(dir.path());
+
+        let (status, body) = do_paste(
+            &router,
+            &[src.display().to_string().as_str()],
+            &dest.display().to_string(),
+            false,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let expected = dest.join("a (copy).txt");
+        assert_eq!(body.path.as_deref(), Some(expected.display().to_string().as_str()));
+        assert_eq!(std::fs::read(&expected).unwrap(), b"new\n");
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"old\n");
+    }
+
+    #[tokio::test]
+    async fn paste_cut_moves_and_removes_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        std::fs::write(&src, "data\n").unwrap();
+        let dest = dir.path().join("dst");
+        std::fs::create_dir(&dest).unwrap();
+        let router = app_for(dir.path());
+
+        let (status, body) = do_paste(
+            &router,
+            &[src.display().to_string().as_str()],
+            &dest.display().to_string(),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let expected = dest.join("a.txt");
+        assert_eq!(body.path.as_deref(), Some(expected.display().to_string().as_str()));
+        assert_eq!(std::fs::read(&expected).unwrap(), b"data\n");
+        assert!(!src.exists(), "cut must remove the source");
+    }
+
+    #[tokio::test]
+    async fn paste_cut_collision_is_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        std::fs::write(&src, "new\n").unwrap();
+        let dest = dir.path().join("dst");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("a.txt"), "old\n").unwrap();
+        let router = app_for(dir.path());
+
+        let (status, body) = do_paste(
+            &router,
+            &[src.display().to_string().as_str()],
+            &dest.display().to_string(),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!body.ok);
+        assert!(src.exists(), "refused cut must leave the source untouched");
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"old\n");
+    }
+
+    #[tokio::test]
+    async fn paste_cut_dir_into_own_subtree_is_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        let router = app_for(dir.path());
+
+        let (status, body) = do_paste(
+            &router,
+            &[src.display().to_string().as_str()],
+            &src.join("sub").display().to_string(),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.ok);
+    }
+
+    #[tokio::test]
+    async fn paste_missing_source_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dst");
+        std::fs::create_dir(&dest).unwrap();
+        let router = app_for(dir.path());
+
+        let (status, body) = do_paste(
+            &router,
+            &[dir.path().join("nope.txt").display().to_string().as_str()],
+            &dest.display().to_string(),
+            false,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.ok);
+    }
+
+    #[tokio::test]
+    async fn paste_missing_dest_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        std::fs::write(&src, "x").unwrap();
+        let router = app_for(dir.path());
+
+        let (status, body) = do_paste(
+            &router,
+            &[src.display().to_string().as_str()],
+            &dir.path().join("nope").display().to_string(),
+            false,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.ok);
+    }
+
+    #[tokio::test]
+    async fn paste_empty_sources_is_bad_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = app_for(dir.path());
+        let (status, body) = do_paste(&router, &[], &dir.path().display().to_string(), false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.ok);
     }
 }

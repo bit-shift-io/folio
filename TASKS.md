@@ -1,87 +1,56 @@
-# TASKS.md for freedesktop-desktop-entry integration
+# TASKS.md for copy/cut/paste (per NOTES.md)
 
-## Phase 1: Setup and Basic Integration
+Client-side clipboard (single `{path, cut}`) + server `POST /paste`. Copy auto-uniquifies
+(`foo (copy).txt`, `foo (copy 2).txt`); cut refuses collisions; ESC cancels a pending cut.
 
-### Task 1: Add freedesktop-desktop-entry dependency
-- [x] Add `freedesktop-desktop-entry = "0.8"` to Cargo.toml dependencies
-- [x] Run `cargo check` to verify dependency resolves correctly
+## Phase 1: Filesystem layer — src/fs/mod.rs
 
-### Task 2: Update imports in src/apps.rs
-- [x] Add `use freedesktop_desktop_entry::{DesktopEntry, Iter};` to imports
-- [ ] Remove unused imports if any
-- [x] Run `cargo check` to verify imports work
+### Task 1: Recursive copy with permission + symlink handling
+- [x] Add `pub fn copy_path(src: &Path, dest: &Path) -> Result<(), FsError>`: files copy byte-exact with perms via `set_permissions`; dirs recurse (create dirs first, then children); symlinks recreated with `std::os::unix::fs::symlink`, never followed; on any error remove the partially built dest and return the io error
+- [x] Add unit tests: byte-exact file, recursive dir preserving structure, symlink copied as a link (target intact, not dereferenced), permissions preserved
+- [x] Run `cargo test`
 
-### Task 3: Replace Fields struct and read_fields function stub
-- [x] Comment out Fields struct and read_fields function (preserve as reference)
-- [x] Add TODO markers for replacement
-- [x] Run `cargo check` to verify code still compiles (will fail on usage, expected)
+### Task 2: Copy destination uniquifier
+- [x] Add `pub fn unique_copy_dest(dest_dir: &Path, name: &str) -> PathBuf`: if `dest_dir/name` is free return it, else `name (copy).ext`, `name (copy 2).ext`, … (existence-checked; handles names without an extension)
+- [x] Add unit tests: no collision, one collision, several collisions
+- [x] Run `cargo test`
 
-## Phase 2: Implement list_apps with freedesktop-desktop-entry
+### Task 3: Guarded move with cross-device fallback
+- [x] Add `pub fn move_path(src: &Path, dest: &Path) -> Result<(), FsError>`: refuse `src == "/"`; refuse moving a directory into its own subtree; try `std::fs::rename`; on `EXDEV` (cross-device) fall back to `copy_path` + `delete_path` of src
+- [x] Add unit tests: plain move within a dir; moving a dir into its own subtree refused (`InvalidInput`); renaming `/` refused
+- [x] Run `cargo test`
 
-### Task 4: Implement basic desktop entry loading in list_apps
-- [ ] Replace read_fields call with DesktopEntry::from_path
-- [ ] Handle Err case by continuing (same as before)
-- [ ] Run `cargo check` to verify basic loading works
+## Phase 2: Server endpoint — src/server/mod.rs
 
-### Task 5: Implement filtering logic using DesktopEntry methods
-- [ ] Replace Fields.type_ check with desktop_entry.type_()
-- [ ] Replace Fields.hidden check with desktop_entry.hidden()
-- [ ] Replace Fields.no_display check with desktop_entry.no_display()
-- [ ] Replace Fields.terminal check with desktop_entry.terminal()
-- [ ] Run `cargo check` to verify filtering compiles
+### Task 4: Paste handler + route
+- [x] Add `PasteRequest { sources: Vec<String>, dest: String, cut: bool }` and `PasteResponse { ok: bool, path: Option<String> }` (serde derive)
+- [x] Add `paste_handler`: reject empty `sources`/`dest` and `source == "/"` (400); resolve absolute via `resolve_path`; missing source → 404; copy → dest = `unique_copy_dest(dest_dir, name)`; cut → refuse if dest exists (409) and refuse dir-into-own-subtree (400); run in `tokio::task::spawn_blocking`; on success broadcast hints (source parent when cut + dest dir) and return 200 with the final path in `path`
+- [x] Register `.route("/paste", post(paste_handler))` in `build_router`
+- [x] Run `cargo check`
 
-### Task 6: Implement flatpak detection
-- [ ] Add flatpak check using desktop_entry.exec()
-- [ ] Maintain same logic as before (skip if exec starts with "flatpak run")
-- [ ] Run `cargo check` to verify flatpak detection works
+### Task 5: Server integration tests
+- [x] Add tests in src/server/mod.rs: copy file → 200 + content present + `path` set; copy collision → uniquified path returned; cut → moved, source gone; cut collision → 409; cut dir into own subtree → 400; missing source → 404; missing dest → 404/400 as mapped
+- [x] Run `cargo test`
 
-### Task 7: Implement executable resolution
-- [ ] Replace Fields.exec and Fields.try_exec usage with desktop_entry methods
-- [ ] Keep existing split_exec and resolvable logic unchanged
-- [ ] Run `cargo check` to verify executable resolution works
+## Phase 3: Client — web/dist/app.js + style.css
 
-### Task 8: Implement AppEntry construction
-- [ ] Replace Fields.name usage with desktop_entry.name() with fallback
-- [ ] Replace Fields.mime_types usage with desktop_entry.mimetypes()
-- [ ] Keep AppEntry struct construction identical
-- [ ] Run `cargo check` to verify AppEntry construction works
+### Task 6: Clipboard state, actions, menu items
+- [x] Add `let clipboard = null;` holding `{path, cut}`; `clearClipboard()`; `copyEntry(path)` sets clipboard, subtitle `Copied: <name>`, re-renders list; `cutEntry(path)` sets clipboard with `cut: true`, subtitle `Cut: <name>`, dims matched rows
+- [x] Add `pasteClipboard()`: POST `/paste` `{sources:[clipboard.path], dest: currentDir, cut: clipboard.cut}`; on success clear clipboard, subtitle `Pasted → <dir>`, refetch (reuse `onFileChanged`), `selectFile(result.path)`; on 409 and other failures show a clear message
+- [x] Add `Copy` and `Cut` buttons to the preview ⋯ dropdown (before Rename) operating on the previewed path; Paste stays keyboard-only
+- [x] Toggle `pending-cut` class on list rows whose path matches a pending cut (refresh in `renderFileList`)
+- [x] Review by eyeballing; no JS test runner in this repo
 
-### Task 9: Verify list_apps completes and compiles
-- [ ] Ensure all error handling is proper
-- [ ] Run `cargo check` to verify entire function compiles
-- [ ] Run `cargo test` to verify existing tests still pass
+### Task 7: Keybindings in boot()
+- [x] Before the `if (e.ctrlKey || e.metaKey || e.altKey) return;` guard in `boot()`: `Ctrl+C` → `copyEntry(selectedFile)`, `Ctrl+X` → `cutEntry(selectedFile)`, `Ctrl+V` → `pasteClipboard()` (each `e.preventDefault()`; no-op when `selectedFile`/clipboard missing); `Escape` → cancel pending cut (clear clipboard + dimming) when no modifier held
+- [x] Keep existing INPUT/TEXTAREA early-return and pane/focus behavior intact
+- [x] Manual key review
 
-## Phase 3: Implement open_with with freedesktop-desktop-entry
+### Task 8: Dimmed pending-cut style
+- [x] Add `.tree-item.pending-cut { opacity: 0.45; }` (dimmed rows) to web/dist/style.css
+- [x] Confirm no existing rule conflicts
 
-### Task 10: Update open_with to use DesktopEntry
-- [ ] Replace read_fields call with DesktopEntry::from_path
-- [ ] Handle Err case by returning LaunchError::NoExec
-- [ ] Run `cargo check` to verify basic loading works
-
-### Task 11: Update exec handling in open_with
-- [ ] Replace Fields.exec usage with desktop_entry.exec()
-- [ ] Handle None case by returning LaunchError::NoExec
-- [ ] Run `cargo check` to verify exec handling works
-
-### Task 12: Verify open_with completes and compiles
-- [ ] Ensure all error handling is proper
-- [ ] Run `cargo check` to verify entire function compiles
-- [ ] Run `cargo test` to verify existing tests still pass
-
-## Phase 4: Cleanup and Finalization
-
-### Task 13: Remove obsolete code
-- [ ] Completely remove Fields struct and read_fields function
-- [ ] Remove is_flatpak function (inline the check)
-- [ ] Verify no unused imports remain
-- [ ] Run `cargo check` to verify code compiles without old code
-
-### Task 14: Final test run
-- [ ] Run full test suite: `cargo test`
-- [ ] Ensure all tests pass
-- [ ] Run integration tests specifically: `cargo test --tests`
-
-### Task 15: Verify functionality manually (if possible)
-- [ ] Run folio with a test directory
-- [ ] Verify /apps endpoint returns expected applications
-- [ ] Verify /open endpoint works for known applications
+## Final verification
+- [x] `cargo build` with zero warnings
+- [x] `cargo test` all green
+- [x] Manual pass via `./run.sh --root <dir>`: copy/cut/paste, collision-uniquify, collide-cut refusal, ESC cancel

@@ -3,7 +3,7 @@
 //! initial directory the browser opens on, it is not a confinement boundary.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One node in the file browser. `path` is an absolute path; `depth` is always
 /// `0` from the server (the client layouts rows itself).
@@ -448,6 +448,105 @@ pub fn rename_path(from: &Path, to: &Path) -> Result<(), FsError> {
     std::fs::rename(from, to).map_err(FsError::Io)
 }
 
+/// Recursively copies `src` to `dest`. Files copy byte-exact with permissions,
+/// directories mirror their structure, and symlinks are recreated as links
+/// (never followed). On any error the partially built destination is removed
+/// before the io error is returned.
+pub fn copy_path(src: &Path, dest: &Path) -> Result<(), FsError> {
+    fn copy_inner(src: &Path, dest: &Path) -> io::Result<()> {
+        let meta = std::fs::symlink_metadata(src)?;
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(src)?;
+            return std::os::unix::fs::symlink(&target, dest);
+        }
+        if meta.is_dir() {
+            std::fs::create_dir(dest)?;
+            let read = std::fs::read_dir(src)?;
+            for item in read {
+                let item = item?;
+                let name = item.file_name();
+                copy_inner(&item.path(), &dest.join(&name))?;
+            }
+            Ok(())
+        } else {
+            std::fs::copy(src, dest)?;
+            std::fs::set_permissions(dest, meta.permissions())
+        }
+    }
+
+    match copy_inner(src, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if dest != src {
+                clean_partial(dest);
+            }
+            Err(FsError::Io(e))
+        }
+    }
+}
+
+/// Moves (or renames) a file or directory between two absolute paths. Refuses
+/// to move the filesystem root or move a directory into its own subtree, and
+/// falls back to copy + delete when the rename crosses a device boundary.
+pub fn move_path(src: &Path, dest: &Path) -> Result<(), FsError> {
+    if src == Path::new("/") {
+        return Err(invalid("cannot move the root directory"));
+    }
+    let meta = std::fs::symlink_metadata(src).map_err(FsError::Io)?;
+    if meta.is_dir() && dest.starts_with(src) {
+        return Err(invalid("cannot move a directory into its own subtree"));
+    }
+    match std::fs::rename(src, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+            copy_path(src, dest)?;
+            delete_path(src)
+        }
+        Err(e) => Err(FsError::Io(e)),
+    }
+}
+
+fn clean_partial(dest: &Path) {
+    let result = match std::fs::symlink_metadata(dest) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => std::fs::remove_dir_all(dest),
+        _ => std::fs::remove_file(dest),
+    };
+    if let Err(e) = result {
+        if e.kind() != io::ErrorKind::NotFound {
+            tracing::warn!("failed to clean partial copy at {dest:?}: {e}");
+        }
+    }
+}
+
+/// Returns the destination path for a copy of `name` into `dest_dir`,
+/// uniquified so nothing is ever overwritten: the free name as-is, otherwise
+/// `name (copy).ext`, `name (copy 2).ext`, and so on. Names without a
+/// `file_stem`/extension pair (e.g. dotfiles or extensionless names) get the
+/// suffix appended to the whole name.
+pub fn unique_copy_dest(dest_dir: &Path, name: &str) -> PathBuf {
+    let direct = dest_dir.join(name);
+    if !direct.exists() {
+        return direct;
+    }
+    let path = Path::new(name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let ext = path.extension().and_then(|e| e.to_str());
+    let mut n = 1;
+    loop {
+        let candidate_name = match ext {
+            Some(ext) if n == 1 => format!("{stem} (copy).{ext}"),
+            Some(ext) => format!("{stem} (copy {n}).{ext}"),
+            None if n == 1 => format!("{stem} (copy)"),
+            None => format!("{stem} (copy {n})"),
+        };
+        let candidate = dest_dir.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +760,157 @@ mod tests {
             Err(FsError::Io(_))
         ));
         assert!(matches!(rename_path(Path::new("/"), Path::new("/x")), Err(FsError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn copy_file_is_byte_exact_named_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello world\n").unwrap();
+
+        copy_path(&dir.path().join("a.txt"), &dir.path().join("b.txt")).unwrap();
+
+        let orig = std::fs::read(dir.path().join("a.txt")).unwrap();
+        let copied = std::fs::read(dir.path().join("b.txt")).unwrap();
+        assert_eq!(orig, copied);
+    }
+
+    #[test]
+    fn copy_dir_preserves_structure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/sub")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.path().join("src/sub/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::create_dir(dir.path().join("src/empty")).unwrap();
+
+        copy_path(&dir.path().join("src"), &dir.path().join("dst")).unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join("dst/main.rs")).unwrap(),
+            b"fn main() {}\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("dst/sub/lib.rs")).unwrap(),
+            b"pub fn f() {}\n"
+        );
+        assert!(dir.path().join("dst/empty").is_dir());
+    }
+
+    #[test]
+    fn copy_symlink_stays_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("target.txt"), "data\n").unwrap();
+        let link = dir.path().join("alias");
+        std::os::unix::fs::symlink(dir.path().join("target.txt"), &link).unwrap();
+
+        copy_path(&link, &dir.path().join("copied")).unwrap();
+
+        let resolved = std::fs::read_link(dir.path().join("copied")).unwrap();
+        assert_eq!(resolved, dir.path().join("target.txt"));
+        let contents = std::fs::read(dir.path().join("copied")).unwrap();
+        assert_eq!(contents, b"data\n");
+    }
+
+    #[test]
+    fn copy_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("run.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(dir.path().join("run.sh"), std::fs::Permissions::from_mode(0o751))
+            .unwrap();
+
+        copy_path(&dir.path().join("run.sh"), &dir.path().join("copied.sh")).unwrap();
+
+        let mode = std::fs::metadata(dir.path().join("copied.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o751);
+    }
+
+    #[test]
+    fn copy_failure_removes_partial_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+
+        // Copying into a nonexistent parent dir fails, and the partial
+        // destination must not linger.
+        let result = copy_path(&dir.path().join("a.txt"), &dir.path().join("nope/b.txt"));
+        assert!(result.is_err());
+        assert!(!dir.path().join("nope").exists());
+    }
+
+    #[test]
+    fn unique_copy_dest_returns_free_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            unique_copy_dest(dir.path(), "a.txt"),
+            dir.path().join("a.txt")
+        );
+    }
+
+    #[test]
+    fn unique_copy_dest_appends_copy_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+
+        assert_eq!(
+            unique_copy_dest(dir.path(), "a.txt"),
+            dir.path().join("a (copy).txt")
+        );
+    }
+
+    #[test]
+    fn unique_copy_dest_counts_past_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "a (copy).txt", "a (copy 2).txt"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+
+        assert_eq!(
+            unique_copy_dest(dir.path(), "a.txt"),
+            dir.path().join("a (copy 3).txt")
+        );
+    }
+
+    #[test]
+    fn unique_copy_dest_handles_names_without_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Makefile"), "all:\n").unwrap();
+        std::fs::write(dir.path().join("Makefile (copy)"), "all:\n").unwrap();
+
+        assert_eq!(
+            unique_copy_dest(dir.path(), "Makefile"),
+            dir.path().join("Makefile (copy 2)")
+        );
+    }
+
+    #[test]
+    fn move_path_moves_within_a_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+
+        move_path(&dir.path().join("a.txt"), &dir.path().join("b.txt")).unwrap();
+
+        assert!(dir.path().join("b.txt").exists());
+        assert!(!dir.path().join("a.txt").exists());
+    }
+
+    #[test]
+    fn move_path_refuses_moving_dir_into_own_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/sub")).unwrap();
+
+        assert!(matches!(
+            move_path(&dir.path().join("src"), &dir.path().join("src/sub/child")),
+            Err(FsError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn move_path_refuses_fs_root() {
+        assert!(matches!(
+            move_path(Path::new("/"), Path::new("/x")),
+            Err(FsError::InvalidInput(_))
+        ));
     }
 }

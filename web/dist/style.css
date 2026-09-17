@@ -122,6 +122,8 @@ body {
 
 .tree-item.focused { background: var(--bg-hover); }
 
+.tree-item.pending-cut { opacity: 0.45; }
+
 .pane-active { box-shadow: inset 0 0 0 1px var(--accent); }
 
 .tree-toggle {

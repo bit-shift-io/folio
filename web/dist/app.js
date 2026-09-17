@@ -33,6 +33,7 @@ let gridIndex = -1;
 let currentFileMime = "";
 let appsCache = null;
 let previewProps = false;
+let clipboard = null;
 const GRID_MAX = 10;
 
 const ICON_THEME = "breeze-dark";
@@ -285,6 +286,11 @@ function parentOf(path) {
   const slash = p.lastIndexOf("/");
   if (slash <= 0) return "/";
   return p.slice(0, slash);
+}
+
+function baseName(path) {
+  const slash = path.lastIndexOf("/");
+  return slash < 0 ? path : path.slice(slash + 1);
 }
 
 function visibleEntry(entry) {
@@ -601,7 +607,7 @@ function renderFileList() {
     setSubtitle(listEntries.length ? listEntries.length + " matches" : "No matches");
     for (const entry of listEntries) {
       const row = document.createElement("div");
-      row.className = "tree-item" + (selectedFile === entry.path ? " selected" : "");
+      row.className = "tree-item" + (selectedFile === entry.path ? " selected" : "") + (isPendingCut(entry.path) ? " pending-cut" : "");
       const icon = iconEl(entry);
       const name = document.createElement("span");
       name.textContent = entry.path;
@@ -618,7 +624,7 @@ function renderFileList() {
     listEntries = files;
     for (const entry of files) {
       const row = document.createElement("div");
-      row.className = "tree-item" + (selectedFile === entry.path ? " selected" : "");
+      row.className = "tree-item" + (selectedFile === entry.path ? " selected" : "") + (isPendingCut(entry.path) ? " pending-cut" : "");
       const icon = iconEl(entry);
       const name = document.createElement("span");
       name.textContent = entry.name;
@@ -739,6 +745,20 @@ async function selectFile(path) {
         props.type = "button";
         props.textContent = previewProps ? "Hide properties" : "Properties";
         props.addEventListener("click", () => toggleProperties(path));
+        const copy = document.createElement("button");
+        copy.type = "button";
+        copy.textContent = "Copy";
+        copy.addEventListener("click", () => {
+          hideDropdown();
+          copyEntry(path);
+        });
+        const cut = document.createElement("button");
+        cut.type = "button";
+        cut.textContent = "Cut";
+        cut.addEventListener("click", () => {
+          hideDropdown();
+          cutEntry(path);
+        });
         const rename = document.createElement("button");
         rename.type = "button";
         rename.textContent = "Rename";
@@ -748,7 +768,7 @@ async function selectFile(path) {
         del.textContent = "Delete";
         del.className = "danger";
         del.addEventListener("click", () => deleteFile(path));
-        menu.append(props, rename, del);
+        menu.append(props, copy, cut, rename, del);
       });
     });
     previewHeader.appendChild(menuBtn);
@@ -1136,6 +1156,71 @@ async function deleteFile(path) {
   resetPreview();
 }
 
+function isPendingCut(path) {
+  return !!(clipboard && clipboard.cut && clipboard.path === path);
+}
+
+function clearClipboard() {
+  clipboard = null;
+  renderFileList();
+}
+
+function copyEntry(path) {
+  if (!path) return;
+  clipboard = { path, cut: false };
+  setSubtitle("Copied: " + baseName(path));
+  renderFileList();
+}
+
+function cutEntry(path) {
+  if (!path) return;
+  clipboard = { path, cut: true };
+  setSubtitle("Cut: " + baseName(path));
+  renderFileList();
+}
+
+async function pasteClipboard() {
+  if (!clipboard) return;
+  const source = clipboard;
+  hideDropdown();
+  let res;
+  try {
+    res = await fetch("/paste", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sources: [source.path], dest: currentDir, cut: source.cut }),
+    });
+  } catch {
+    setSubtitle("paste failed");
+    return;
+  }
+  let data = {};
+  try {
+    data = await res.json();
+  } catch {}
+  if (!res.ok || !data.ok) {
+    if (res.status === 409) {
+      setSubtitle("cannot paste: \"" + baseName(source.path) + "\" already exists here");
+    } else if (res.status === 404) {
+      setSubtitle("paste failed: source or destination no longer exists");
+    } else if (res.status === 400) {
+      setSubtitle("cannot paste here");
+    } else {
+      setSubtitle("paste failed");
+    }
+    return;
+  }
+  clipboard = null;
+  const destDir = currentDir;
+  selectedFile = null;
+  setSubtitle("Pasted \u2192 " + destDir);
+  await onFileChanged(destDir);
+  if (data.path) {
+    selectedFile = data.path;
+    await selectFile(data.path);
+  }
+}
+
 let changesTimer = null;
 let pendingPath = null;
 
@@ -1324,6 +1409,28 @@ async function boot() {
       e.preventDefault();
       showHidden = !showHidden;
       refreshView();
+      return;
+    }
+    if (e.ctrlKey && e.key.toLowerCase() === "c") {
+      e.preventDefault();
+      copyEntry(selectedFile);
+      return;
+    }
+    if (e.ctrlKey && e.key.toLowerCase() === "x") {
+      e.preventDefault();
+      cutEntry(selectedFile);
+      return;
+    }
+    if (e.ctrlKey && e.key.toLowerCase() === "v") {
+      e.preventDefault();
+      pasteClipboard();
+      return;
+    }
+    if (e.key === "Escape" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      if (clipboard && clipboard.cut) {
+        clearClipboard();
+        setSubtitle("cut cancelled");
+      }
       return;
     }
     if (e.ctrlKey || e.metaKey || e.altKey) return;
