@@ -41,11 +41,10 @@ pub fn probe(path: &Path, mime: &str) -> Option<MediaInfo> {
     let metadata = fs::metadata(path).ok()?;
     let size = metadata.len();
     let duration = match mime {
-        "audio/x-wav" | "audio/wav" => read_head(path, HEAD_CAP)
-            .and_then(|b| wav_duration(&b, size)),
-        "audio/flac" | "audio/x-flac" => {
-            read_head(path, HEAD_CAP).and_then(|b| flac_duration(&b))
+        "audio/x-wav" | "audio/wav" => {
+            read_head(path, HEAD_CAP).and_then(|b| wav_duration(&b, size))
         }
+        "audio/flac" | "audio/x-flac" => read_head(path, HEAD_CAP).and_then(|b| flac_duration(&b)),
         "audio/mpeg" => read_head(path, HEAD_CAP).and_then(|b| mp3_duration(&b, size)),
         "audio/mp4" | "video/mp4" | "video/quicktime" | "audio/m4a" => mp4_duration(path),
         _ => None,
@@ -76,7 +75,8 @@ pub fn image_dimensions(buf: &[u8], mime: &str) -> Option<(u32, u32)> {
     if mime == "image/jpeg" && buf.len() >= 4 && buf[0] == 0xFF && buf[1] == 0xD8 {
         return jpeg_dimensions(buf);
     }
-    if mime == "image/gif" && buf.len() >= 10
+    if mime == "image/gif"
+        && buf.len() >= 10
         && (buf.starts_with(b"GIF87a") || buf.starts_with(b"GIF89a"))
     {
         return Some((le16(buf, 6)? as u32, le16(buf, 8)? as u32));
@@ -190,8 +190,9 @@ fn flac_duration(buf: &[u8]) -> Option<f64> {
     Some(total as f64 / sample_rate as f64)
 }
 
-const MPEG1_L3_BITRATE_K: [u32; 16] =
-    [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+const MPEG1_L3_BITRATE_K: [u32; 16] = [
+    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
+];
 
 /// Duration estimate for CBR MP3: `size * 8 / bitrate`, from the first MPEG
 /// audio frame after any ID3v2 tag.
@@ -279,7 +280,9 @@ fn be32(buf: &[u8], off: usize) -> Option<u32> {
 
 fn be64(buf: &[u8], off: usize) -> Option<u64> {
     let s = buf.get(off..off + 8)?;
-    Some(u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+    Some(u64::from_be_bytes([
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+    ]))
 }
 
 fn le16(buf: &[u8], off: usize) -> Option<u16> {
@@ -323,7 +326,11 @@ mod tests {
 
     #[test]
     fn gif_and_bmp_dimensions() {
-        let gif = &b"GIF89a"[..].iter().copied().chain([0x14, 0x00, 0x0A, 0x00]).collect::<Vec<u8>>();
+        let gif = &b"GIF89a"[..]
+            .iter()
+            .copied()
+            .chain([0x14, 0x00, 0x0A, 0x00])
+            .collect::<Vec<u8>>();
         assert_eq!(image_dimensions(gif, "image/gif"), Some((20, 10)));
         let mut bmp = vec![0u8; 26];
         bmp[..2].copy_from_slice(b"BM");
@@ -364,7 +371,7 @@ mod tests {
     fn flac_duration_from_streaminfo() {
         let mut buf = vec![0u8; 42];
         buf[..4].copy_from_slice(b"fLaC");
-        buf[4] = 0x80 | 0; // last metadata block, type STREAMINFO
+        buf[4] = 0x80; // last metadata block, type STREAMINFO
         buf[5] = 0;
         buf[6] = 0;
         buf[7] = 34; // 34-byte STREAMINFO body

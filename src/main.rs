@@ -5,23 +5,8 @@
 //! filesystem moves. Browsing is unrestricted — `..` and the path bar reach
 //! anywhere a shell can.
 
-use std::path::PathBuf;
-
-use clap::Parser;
-
+use folio::cli::{self, Outcome};
 use folio::server;
-
-#[derive(Parser)]
-#[command(name = "folio", about = "Local web file explorer")]
-struct Cli {
-    /// Initial directory to browse (default: current directory)
-    #[arg(long, default_value = ".")]
-    root: PathBuf,
-
-    /// Port to bind on 127.0.0.1
-    #[arg(long, default_value_t = 4000)]
-    port: u16,
-}
 
 #[tokio::main]
 async fn main() {
@@ -33,10 +18,23 @@ async fn main() {
         )
         .init();
 
-    let cli = Cli::parse();
+    let args = match cli::parse_from(std::env::args().skip(1)) {
+        Ok(Outcome::Run(args)) => args,
+        Ok(Outcome::Help) => {
+            println!("{}", cli::USAGE);
+            return;
+        }
+        Ok(Outcome::Version) => {
+            println!("{}", cli::VERSION);
+            return;
+        }
+        Err(e) => {
+            tracing::error!("{e}\n\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+    };
 
-    let root = std::fs::canonicalize(&cli.root)
-        .unwrap_or_else(|_| cli.root.clone());
+    let root = std::fs::canonicalize(&args.root).unwrap_or_else(|_| args.root.clone());
 
     if !root.is_dir() {
         tracing::error!("root is not a directory: {}", root.display());
@@ -47,10 +45,10 @@ async fn main() {
     state.spawn_watcher();
     let app = server::build_router(state);
 
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", cli.port)).await {
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("failed to bind 127.0.0.1:{}: {e}", cli.port);
+            tracing::error!("failed to bind 127.0.0.1:{}: {e}", args.port);
             std::process::exit(1);
         }
     };
@@ -58,7 +56,7 @@ async fn main() {
     tracing::info!(
         "folio serving {} at http://127.0.0.1:{}/",
         root.display(),
-        cli.port
+        args.port
     );
 
     axum::serve(listener, app).await.expect("server error");

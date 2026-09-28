@@ -7,7 +7,11 @@ use folio::server::{self, AppState};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 
-async fn setup() -> (tempfile::TempDir, String, tokio::task::JoinHandle<Result<(), std::io::Error>>) {
+async fn setup() -> (
+    tempfile::TempDir,
+    String,
+    tokio::task::JoinHandle<Result<(), std::io::Error>>,
+) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("hello.txt"), "hi").unwrap();
     std::fs::create_dir(dir.path().join("inner")).unwrap();
@@ -24,24 +28,52 @@ async fn setup() -> (tempfile::TempDir, String, tokio::task::JoinHandle<Result<(
     (dir, format!("127.0.0.1:{port}"), handle)
 }
 
+/// Sends a minimal HTTP/1.1 request over a raw `TcpStream` and reads the
+/// response to EOF. Returns `(status_code, body)`. Deliberately hand-rolled:
+/// the integration tests only ever talk to folio on loopback, and an HTTP
+/// client crate would dwarf the thing under test.
+async fn http_request(addr: &str, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    match body {
+        Some(b) => {
+            req.push_str("Content-Type: application/json\r\n");
+            req.push_str(&format!("Content-Length: {}\r\n", b.len()));
+        }
+        None => req.push_str("Content-Length: 0\r\n"),
+    }
+    req.push_str("\r\n");
+    if let Some(b) = body {
+        req.push_str(b);
+    }
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+
+    // Split the status line off the body: "HTTP/1.1 200 OK" → 200.
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("malformed response for {path}: {text:?}"));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line for {path}: {head:?}"));
+    (status, body.to_string())
+}
+
 async fn http_get(addr: &str, path: &str) -> (u16, String) {
-    let res = reqwest::Client::new()
-        .get(format!("http://{addr}{path}"))
-        .send()
-        .await
-        .unwrap();
-    (res.status().as_u16(), res.text().await.unwrap())
+    http_request(addr, "GET", path, None).await
 }
 
 async fn http_post(addr: &str, path: &str, body: &str) -> (u16, String) {
-    let res = reqwest::Client::new()
-        .post(format!("http://{addr}{path}"))
-        .header("content-type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await
-        .unwrap();
-    (res.status().as_u16(), res.text().await.unwrap())
+    http_request(addr, "POST", path, Some(body)).await
 }
 
 #[tokio::test]
@@ -97,7 +129,12 @@ async fn filecontent_and_search_work() {
 async fn rename_and_delete_mutate_and_broadcast_hints() {
     let (_dir, addr, _handle) = setup().await;
 
-    let (status, body) = http_post(&addr, "/rename", r#"{"path":"hello.txt","to":"renamed.txt"}"#).await;
+    let (status, body) = http_post(
+        &addr,
+        "/rename",
+        r#"{"path":"hello.txt","to":"renamed.txt"}"#,
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
 
     let (status, body) = http_get(&addr, "/filetree?path=").await;
@@ -191,9 +228,11 @@ async fn websocket_watch_message_retargets_the_watcher() {
         }
     }
 
-    ws.send(Message::Text(format!(r#"{{"type":"watch","path":"{root_s}/dirB"}}"#).into()))
-        .await
-        .unwrap();
+    ws.send(Message::Text(
+        format!(r#"{{"type":"watch","path":"{root_s}/dirB"}}"#).into(),
+    ))
+    .await
+    .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     std::fs::write(dir.path().join("dirB").join("created.txt"), "new").unwrap();
@@ -215,13 +254,12 @@ async fn websocket_watch_message_retargets_the_watcher() {
     assert!(saw, "expected a change hint for watched dirB");
 
     std::fs::write(dir.path().join("dirA").join("untracked.txt"), "x").unwrap();
-    match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
-        Ok(Some(Ok(Message::Text(text)))) => {
-            assert!(
-                !text.to_string().contains("dirA"),
-                "dirA was unwatched, got hint: {text}"
-            );
-        }
-        _ => {}
+    if let Ok(Some(Ok(Message::Text(text)))) =
+        tokio::time::timeout(Duration::from_millis(500), ws.next()).await
+    {
+        assert!(
+            !text.to_string().contains("dirA"),
+            "dirA was unwatched, got hint: {text}"
+        );
     }
 }

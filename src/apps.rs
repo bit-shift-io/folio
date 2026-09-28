@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
-use freedesktop_desktop_entry::DesktopEntry;
 
 /// One installed application as surfaced to the dropdown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,67 +73,81 @@ fn app_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-// TODO: Replace Fields struct and read_fields function with freedesktop-desktop-entry
-//#[derive(Default)]
-//struct Fields {
-//    id: String,
-//    type_: String,
-//    name: String,
-//    exec: String,
-//    try_exec: Option<String>,
-//    icon: String,
-//    hidden: bool,
-//    no_display: bool,
-//    terminal: bool,
-//    mime_types: Vec<String>,
-//
-//fn read_fields(path: &Path) -> Option<Fields> {
-//    let content = std::fs::read_to_string(path).ok()?;
-//    let mut f = Fields {
-//        id: path.display().to_string(),
-//        ..Fields::default()
-//    };
-//    let mut in_main = false;
-//    for raw in content.lines() {
-//        let line = raw.trim();
-//        if line.is_empty() || line.starts_with('#') {
-//            continue;
-//        }
-//        if line.starts_with('[') {
-//            in_main = line == "[Desktop Entry]";
-//            continue;
-//        }
-//        if !in_main {
-//            continue;
-//        }
-//        let Some((key, value)) = line.split_once('=') else {
-//            continue;
-//        };
-//        let value = value.trim();
-//        match key {
-//            "Type" => f.type_ = value.to_string(),
-//            "Name" => {
-//                if f.name.is_empty() {
-//                    f.name = value.to_string();
-//                }
-//            }
-//            "Exec" => f.exec = value.to_string(),
-//            "TryExec" => f.try_exec = Some(value.to_string()),
-//            "Icon" => f.icon = value.to_string(),
-//            "Hidden" => f.hidden = value == "true",
-//            "NoDisplay" => f.no_display = value == "true",
-//            "Terminal" => f.terminal = value == "true",
-//            "MimeType" => {
-//                f.mime_types.extend(
-//                    value
-//                        .split(';')
-//                        .map(str::trim)
-//                        .filter(|m| !m.is_empty())
-//                        .map(str::to_string),
-////                );
-//            }
-//            _ => {}
-//        }
+/// The fields of a `[Desktop Entry]` group that folio actually reads. Parsed
+/// by hand from the flat INI-ish format; only the main group is considered and
+/// localized `Key[lang]=` variants are ignored.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Fields {
+    /// Desktop-entry id: the file name without its `.desktop` suffix.
+    appid: String,
+    type_: String,
+    name: String,
+    exec: String,
+    try_exec: Option<String>,
+    icon: String,
+    hidden: bool,
+    no_display: bool,
+    terminal: bool,
+    mime_types: Vec<String>,
+    /// KDE's `X-KDE-AliasFor`: the appid of the entry this one aliases.
+    alias_for: Option<String>,
+}
+
+/// Reads the `[Desktop Entry]` group of a `.desktop` file. Comments, blank
+/// lines and every other group (`[Desktop Action …]`) are skipped, and only
+/// unlocalized keys are considered. Returns `None` when the file cannot be
+/// read or has no `[Desktop Entry]` group at all.
+fn read_fields(path: &Path) -> Option<Fields> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut f = Fields {
+        appid: path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        ..Fields::default()
+    };
+    let mut in_main = false;
+    let mut seen_group = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_main = line == "[Desktop Entry]";
+            seen_group |= in_main;
+            continue;
+        }
+        if !in_main {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key {
+            "Type" => f.type_ = value.to_string(),
+            "Name" => f.name = value.to_string(),
+            "Exec" => f.exec = value.to_string(),
+            "TryExec" => f.try_exec = Some(value.to_string()),
+            "Icon" => f.icon = value.to_string(),
+            "Hidden" => f.hidden = value == "true",
+            "NoDisplay" => f.no_display = value == "true",
+            "Terminal" => f.terminal = value == "true",
+            "MimeType" => f.mime_types.extend(
+                value
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .map(str::to_string),
+            ),
+            "X-KDE-AliasFor" => f.alias_for = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    seen_group.then_some(f)
+}
 
 fn resolvable(token: &str) -> bool {
     if token.contains('/') {
@@ -150,98 +163,132 @@ fn find_in_path(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// What one `.desktop` file turned out to be.
+enum Scanned {
+    /// A launchable, visible app, plus its appid for alias lookups.
+    Keep(AppEntry, String),
+    /// A hidden KDE alias helper to fold into another entry later.
+    Helper(PathBuf),
+    /// Not an app folio will offer: wrong type, hidden, terminal, unlaunchable.
+    Skip,
+}
+
+/// Vets a single `.desktop` file and builds the dropdown entry for it, if any.
+fn scan_entry(path: PathBuf) -> Scanned {
+    if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+        return Scanned::Skip;
+    }
+    let Some(f) = read_fields(&path) else {
+        return Scanned::Skip;
+    };
+    if f.type_ != "Application" || f.hidden || f.terminal || f.exec.trim().is_empty() {
+        return Scanned::Skip;
+    }
+    // flatpak apps would have to be launched through a sandbox shim; skip them
+    // rather than spawn something that outlives the request.
+    if f.exec.starts_with("flatpak run") {
+        return Scanned::Skip;
+    }
+    if f.no_display {
+        return match f.alias_for {
+            Some(_) => Scanned::Helper(path),
+            None => Scanned::Skip,
+        };
+    }
+
+    let Some(first) = split_exec(&f.exec).into_iter().next() else {
+        return Scanned::Skip;
+    };
+    let available = match f.try_exec.as_deref() {
+        Some(t) => resolvable(t),
+        None => resolvable(&first),
+    };
+    if !available {
+        return Scanned::Skip;
+    }
+
+    let name = if f.name.is_empty() {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    } else {
+        f.name.clone()
+    };
+    let mut mime_types = f.mime_types.clone();
+    if !mime_types.contains(&"inode/directory".to_string()) && accepts_files_or_urls(&f.exec) {
+        mime_types.push("inode/directory".to_string());
+    }
+    let appid = f.appid;
+    Scanned::Keep(
+        AppEntry {
+            id: path.display().to_string(),
+            name,
+            mime_types,
+        },
+        appid,
+    )
+}
+
 /// Enumerates installed applications: `Type=Application`, visible, non-
 /// terminal, with a launchable command. Sorted by name for a stable dropdown.
 pub fn list_apps() -> Vec<AppEntry> {
     let mut apps: Vec<AppEntry> = Vec::new();
     let mut by_appid: HashMap<String, usize> = HashMap::new();
-    let mut helpers: Vec<std::path::PathBuf> = Vec::new();
+    let mut helpers: Vec<PathBuf> = Vec::new();
 
     for dir in app_dirs() {
         let Ok(read) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in read.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
-                continue;
-            }
-            let Ok(de) = DesktopEntry::from_path(&path, None as Option<&[String]>) else {
-                continue;
-            };
-            if de.type_() != Some("Application")
-                || de.hidden()
-                || de.terminal()
-                || de.exec().as_deref().map_or(true, |e| e.trim().is_empty())
-                || de.exec().unwrap_or_default().starts_with("flatpak run")
-            {
-                continue;
-            };
-
-            if de.no_display() {
-                if de.desktop_entry("X-KDE-AliasFor").is_some() {
-                    helpers.push(path);
+            match scan_entry(entry.path()) {
+                Scanned::Keep(app, appid) => {
+                    by_appid.insert(appid, apps.len());
+                    apps.push(app);
                 }
-                continue;
+                Scanned::Helper(path) => helpers.push(path),
+                Scanned::Skip => {}
             }
-
-            let Some(first) = split_exec(&de.exec().unwrap_or_default()).into_iter().next() else {
-                continue;
-            };
-            let available = match de.try_exec() {
-                Some(t) => resolvable(t),
-                None => resolvable(&first),
-            };
-            if !available {
-                continue;
-            }
-            let name = if de.name(&[] as &[String]).as_deref().map_or(true, |n| n.is_empty()) {
-                path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string()
-            } else {
-                de.name(&[] as &[String]).unwrap().to_string()
-            };
-            let exec = de.exec().unwrap_or_default();
-            let mut mime_types: Vec<String> =
-                de.mime_type().unwrap_or_default().into_iter().map(|s| s.to_string()).filter(|s| !s.is_empty()).collect();
-            if !mime_types.contains(&"inode/directory".to_string()) && accepts_files_or_urls(&exec) {
-                mime_types.push("inode/directory".to_string());
-            }
-            by_appid.insert(de.appid.clone(), apps.len());
-            apps.push(AppEntry {
-                id: path.display().to_string(),
-                name,
-                mime_types,
-            });
         }
     }
 
+    merge_alias_helpers(&mut apps, &helpers, &by_appid);
+    apps.sort_by_key(|a| a.name.to_lowercase());
+    apps
+}
+
+/// Folds the MIME types of KDE alias helpers into the entries they alias. A
+/// helper is a `NoDisplay` entry whose `X-KDE-AliasFor` names another appid;
+/// its types are extra file associations for that app, not a separate entry.
+fn merge_alias_helpers(
+    apps: &mut [AppEntry],
+    helpers: &[PathBuf],
+    by_appid: &HashMap<String, usize>,
+) {
     for path in helpers {
-        let Ok(de) = DesktopEntry::from_path(&path, None as Option<&[String]>) else {
+        let Some(f) = read_fields(path) else {
             continue;
         };
-        let Some(alias) = de.desktop_entry("X-KDE-AliasFor") else {
+        let Some(alias) = f.alias_for.as_deref() else {
             continue;
         };
-        let alias_appid = alias.trim().strip_suffix(".desktop").unwrap_or(alias.trim());
+        let alias_appid = alias
+            .trim()
+            .strip_suffix(".desktop")
+            .unwrap_or(alias.trim());
         if alias_appid.is_empty() {
             continue;
         }
         let Some(&idx) = by_appid.get(alias_appid) else {
             continue;
         };
-        for m in de.mime_type().unwrap_or_default() {
-            let m = m.to_string();
-            if !m.is_empty() && !apps[idx].mime_types.contains(&m) {
-                apps[idx].mime_types.push(m);
+        for m in &f.mime_types {
+            if !m.is_empty() && !apps[idx].mime_types.contains(m) {
+                apps[idx].mime_types.push(m.clone());
             }
         }
     }
-
-    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    apps
 }
 
 /// True when the Exec line carries `%F`/`%U` (or their lowercase forms), the
@@ -395,14 +442,16 @@ pub fn open_with(id: &str, target: &Path) -> Result<(), LaunchError> {
     if std::fs::symlink_metadata(target).is_err() {
         return Err(LaunchError::MissingTarget(target.display().to_string()));
     }
-    let desktop_entry = DesktopEntry::from_path(Path::new(id), None as Option<&[String]>).map_err(|_| LaunchError::NoExec(id.to_string()))?;
-    if desktop_entry.exec().as_deref().map_or(true, |e| e.trim().is_empty()) {
+    let Some(entry) = read_fields(Path::new(id)) else {
+        return Err(LaunchError::NoExec(id.to_string()));
+    };
+    if entry.exec.trim().is_empty() {
         return Err(LaunchError::NoExec(id.to_string()));
     }
     let (mut argv, used_file) = expand_exec(
-        split_exec(&desktop_entry.exec().unwrap_or_default()),
-        &desktop_entry.name(&[] as &[String]).unwrap(),
-        &desktop_entry.icon().unwrap_or_default(),
+        split_exec(&entry.exec),
+        &entry.name,
+        &entry.icon,
         id,
         target,
     );
@@ -439,9 +488,134 @@ mod tests {
     /// is process-global and would race across parallel test threads.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Writes a `.desktop` file into a fresh temp applications dir and parses
+    /// it with `read_fields`.
+    fn parse_entry(name: &str, body: &str) -> Fields {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        read_fields(&path).expect("entry must parse")
+    }
+
+    #[test]
+    fn read_fields_reads_the_desktop_entry_group_only() {
+        let f = parse_entry(
+            "app.desktop",
+            "# a leading comment\n\
+             [Desktop Entry]\n\
+             Type=Application\n\
+             Name=App\n\
+             \n\
+             Exec=/bin/true\n\
+             TryExec=/bin/true\n\
+             Icon=my-icon\n\
+             \n\
+             [Desktop Action new-window]\n\
+             Name=New Window\n\
+             Exec=/bin/true --new\n\
+             MimeType=image/png;\n\
+             \n\
+             [Desktop Entry Extra]\n\
+             Name=Not Read\n",
+        );
+        assert_eq!(f.appid, "app");
+        assert_eq!(f.type_, "Application");
+        assert_eq!(f.name, "App");
+        assert_eq!(f.exec, "/bin/true");
+        assert_eq!(f.try_exec.as_deref(), Some("/bin/true"));
+        assert_eq!(f.icon, "my-icon");
+        assert!(f.mime_types.is_empty(), "action groups are ignored");
+    }
+
+    #[test]
+    fn read_fields_prefers_the_unlocalized_name() {
+        let f = parse_entry(
+            "app.desktop",
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name[de]=Anwendung\n\
+             Name=Application\n\
+             Name[fr]=Application\n\
+             Exec=/bin/true\n",
+        );
+        assert_eq!(f.name, "Application");
+    }
+
+    #[test]
+    fn read_fields_parses_booleans_literally() {
+        let f = parse_entry(
+            "app.desktop",
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Exec=/bin/true\n\
+             Hidden=true\n\
+             NoDisplay=TRUE\n\
+             Terminal=True\n",
+        );
+        assert!(f.hidden, "only the literal `true` is true");
+        assert!(!f.no_display, "`TRUE` is not `true`");
+        assert!(!f.terminal, "`True` is not `true`");
+
+        let f = parse_entry(
+            "app.desktop",
+            "[Desktop Entry]\nType=Application\nExec=/bin/true\nHidden=false\n",
+        );
+        assert!(!f.hidden);
+    }
+
+    #[test]
+    fn read_fields_splits_mime_type_on_semicolons() {
+        let f = parse_entry(
+            "app.desktop",
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Exec=/bin/true\n\
+             MimeType=text/plain; ;image/png;;text/markdown;\n",
+        );
+        assert_eq!(
+            f.mime_types,
+            vec![
+                "text/plain".to_string(),
+                "image/png".to_string(),
+                "text/markdown".to_string()
+            ],
+            "empties are dropped and entries are trimmed"
+        );
+    }
+
+    #[test]
+    fn read_fields_captures_the_kde_alias_field() {
+        let f = parse_entry(
+            "org.example.app_png.desktop",
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=App\n\
+             Exec=/bin/true %F\n\
+             NoDisplay=true\n\
+             X-KDE-AliasFor=org.example.app.desktop\n\
+             MimeType=image/png;\n",
+        );
+        assert_eq!(f.appid, "org.example.app_png");
+        assert_eq!(f.alias_for.as_deref(), Some("org.example.app.desktop"));
+        assert!(f.no_display);
+    }
+
+    #[test]
+    fn read_fields_returns_none_for_unreadable_or_typeless_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_fields(&dir.path().join("missing.desktop")).is_none());
+
+        // A file with no `[Desktop Entry]` group at all has nothing to read.
+        let stray = dir.path().join("stray.desktop");
+        std::fs::write(&stray, "just some text\n").unwrap();
+        assert!(read_fields(&stray).is_none());
+    }
+
     #[test]
     fn list_apps_reads_xdg_data_home_and_filters_hidden() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let apps_dir = dir.path().join("applications");
         std::fs::create_dir_all(&apps_dir).unwrap();
@@ -471,7 +645,10 @@ mod tests {
             "notapp.desktop",
             "[Desktop Entry]\nType=Link\nName=Not An App\nExec=/bin/false\n",
         );
-        write("noexec.desktop", "[Desktop Entry]\nType=Application\nName=No Exec\n");
+        write(
+            "noexec.desktop",
+            "[Desktop Entry]\nType=Application\nName=No Exec\n",
+        );
         write("stuff.txt", "ignored");
 
         let old = std::env::var_os("XDG_DATA_HOME");
@@ -500,20 +677,20 @@ mod tests {
             editor.mime_types
         );
         assert!(
-            apps
-                .iter()
-                .all(|a| a.name != "Hidden App"
-                    && a.name != "No Display"
-                    && a.name != "Term App"
-                    && a.name != "Not An App"
-                    && a.name != "No Exec"),
+            apps.iter().all(|a| a.name != "Hidden App"
+                && a.name != "No Display"
+                && a.name != "Term App"
+                && a.name != "Not An App"
+                && a.name != "No Exec"),
             "filtered entries leaked: {apps:?}"
         );
     }
 
     #[test]
     fn list_apps_merges_kde_alias_helpers_into_main_entry() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let apps_dir = dir.path().join("applications");
         std::fs::create_dir_all(&apps_dir).unwrap();
@@ -525,7 +702,8 @@ mod tests {
              Exec=/bin/true\n\
              TryExec=/bin/true\n\
              MimeType=application/x-myapp;\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             apps_dir.join("myapp_png.desktop"),
             "[Desktop Entry]\n\
@@ -536,7 +714,8 @@ mod tests {
              NoDisplay=true\n\
              X-KDE-AliasFor=org.example.myapp.desktop\n\
              MimeType=image/png;\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             apps_dir.join("myapp_jpeg.desktop"),
             "[Desktop Entry]\n\
@@ -546,7 +725,8 @@ mod tests {
              NoDisplay=true\n\
              X-KDE-AliasFor=org.example.myapp.desktop\n\
              MimeType=image/jpeg;\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let old = std::env::var_os("XDG_DATA_HOME");
         std::env::set_var("XDG_DATA_HOME", dir.path());
@@ -556,9 +736,13 @@ mod tests {
             None => std::env::remove_var("XDG_DATA_HOME"),
         }
 
-        let myapp = apps.iter().find(|a| a.name == "My App")
+        let myapp = apps
+            .iter()
+            .find(|a| a.name == "My App")
             .expect("my app present");
-        assert!(myapp.mime_types.contains(&"application/x-myapp".to_string()));
+        assert!(myapp
+            .mime_types
+            .contains(&"application/x-myapp".to_string()));
         assert!(myapp.mime_types.contains(&"image/png".to_string()));
         assert!(myapp.mime_types.contains(&"image/jpeg".to_string()));
         assert_eq!(
@@ -593,8 +777,13 @@ mod tests {
         assert!(used);
         assert_eq!(argv, vec!["editor", "/data/readme.md"]);
 
-        let (argv, used) =
-            expand_exec(split_exec("icon-app %i %c %k"), "MyApp", "my-icon", "/x/y.desktop", file);
+        let (argv, used) = expand_exec(
+            split_exec("icon-app %i %c %k"),
+            "MyApp",
+            "my-icon",
+            "/x/y.desktop",
+            file,
+        );
         assert!(!used);
         assert_eq!(
             argv,
@@ -613,7 +802,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn open_with_runs_an_enumerated_app_detached() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let apps_dir = dir.path().join("applications");
         std::fs::create_dir_all(&apps_dir).unwrap();
@@ -661,7 +852,9 @@ mod tests {
 
     #[test]
     fn open_with_rejects_unknown_apps_and_missing_targets() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let apps_dir = dir.path().join("applications");
         std::fs::create_dir_all(&apps_dir).unwrap();
@@ -708,7 +901,9 @@ mod tests {
 
     #[test]
     fn list_apps_injects_inode_directory_for_exec_with_file_or_url_codes() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let apps_dir = dir.path().join("applications");
         std::fs::create_dir_all(&apps_dir).unwrap();
@@ -763,14 +958,18 @@ mod tests {
 
         let url_editor = apps.iter().find(|a| a.name == "URL Editor").unwrap();
         assert!(
-            url_editor.mime_types.contains(&"inode/directory".to_string()),
+            url_editor
+                .mime_types
+                .contains(&"inode/directory".to_string()),
             "url_editor: {:?}",
             url_editor.mime_types
         );
 
         let file_editor = apps.iter().find(|a| a.name == "File Editor").unwrap();
         assert!(
-            file_editor.mime_types.contains(&"inode/directory".to_string()),
+            file_editor
+                .mime_types
+                .contains(&"inode/directory".to_string()),
             "file_editor: {:?}",
             file_editor.mime_types
         );

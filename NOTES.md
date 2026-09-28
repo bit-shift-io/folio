@@ -51,7 +51,22 @@ Grill-confirmed requirements (for the file-browser copy/cut/paste feature).
 - Mutations use `tokio::task::spawn_blocking`; recursive copy is blocking I/O and
   must do the same so the axum runtime stays responsive.
 
-## Open Questions for the Implementing Session
+## Open Questions for the Implementing Session — resolved
 
-- Whether the rename dialog/prompt is reused anywhere for paste collision fixes.
-- `..` row / home-view boundary interaction with a paste into `/` (parent of children).
+Both questions were settled during implementation; recorded here so the file
+reads as a closed record.
+
+- **Is the rename prompt reused for paste collision fixes? No.** The rename
+  dialog is the bare `prompt()` in `renameFile` (`web/dist/app.js`), and paste
+  deliberately does not reuse it. A cut collision surfaces as a `409` and the
+  client only writes a subtitle line (`cannot paste: "<name>" already exists
+  here`) — the user resolves it by deleting or renaming the existing entry, or
+  by navigating somewhere else and pasting again. A prompt would have no useful
+  anchor: the paste *destination* is the list pane's current directory, not the
+  previewed item, and paste is keyboard-only for exactly that reason.
+- **Does the `..` row / home-view boundary affect a paste? No.** The `..` row
+  only flips `treeFull` and re-renders the tree; it never touches `currentDir`,
+  and `currentDir` is sent verbatim as `dest`. The home view is a tree-render
+  filter with no server-side counterpart — folio has no root confinement at
+  all, so a paste into `/` is an ordinary paste into the filesystem root,
+  subject to nothing but the usual uniquify/collision rules.

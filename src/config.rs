@@ -30,9 +30,7 @@ pub fn config_path() -> Option<PathBuf> {
 
 /// Loads the config from the default location (empty defaults when absent).
 pub fn load() -> OpenWithConfig {
-    config_path()
-        .map(|p| load_from(&p))
-        .unwrap_or_default()
+    config_path().map(|p| load_from(&p)).unwrap_or_default()
 }
 
 /// Loads the config from a specific file (defaults when absent or invalid).
@@ -80,8 +78,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let mut cfg = OpenWithConfig::default();
-        cfg.last_app.insert("text/plain".into(), "/usr/share/applications/gedit.desktop".into());
-        cfg.last_app.insert("image/png".into(), "/usr/share/applications/eog.desktop".into());
+        cfg.last_app.insert(
+            "text/plain".into(),
+            "/usr/share/applications/gedit.desktop".into(),
+        );
+        cfg.last_app.insert(
+            "image/png".into(),
+            "/usr/share/applications/eog.desktop".into(),
+        );
         save_to(&path, &cfg);
         assert_eq!(load_from(&path), cfg);
     }
@@ -89,7 +93,10 @@ mod tests {
     #[test]
     fn load_missing_file_returns_default() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_from(&dir.path().join("missing.json")), OpenWithConfig::default());
+        assert_eq!(
+            load_from(&dir.path().join("missing.json")),
+            OpenWithConfig::default()
+        );
     }
 
     #[test]

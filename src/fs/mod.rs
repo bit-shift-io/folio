@@ -54,19 +54,75 @@ pub const PSEUDO_ROOTS: &[&str] = &["proc", "sys", "dev", "run"];
 
 /// Extensions treated as renderable text by the preview pane.
 pub const TEXT_EXTS: &[&str] = &[
-    "rs", "py", "js", "ts", "tsx", "jsx", "c", "cpp", "h", "hpp", "go", "java",
-    "rb", "php", "sh", "bash", "zsh", "fish", "vim", "lua", "r", "swift", "kt",
-    "cs", "fs", "hs", "ex", "exs", "erl", "clj", "lisp", "el", "jl",
-    "toml", "yaml", "yml", "json", "jsonc", "json5", "xml", "html", "htm",
-    "css", "scss", "less", "sql", "graphql", "proto", "md", "txt", "csv",
-    "ini", "cfg", "conf", "env", "gitignore", "gitattributes", "dockerignore",
-    "dockerfile", "makefile", "cmake", "nix", "zig",
+    "rs",
+    "py",
+    "js",
+    "ts",
+    "tsx",
+    "jsx",
+    "c",
+    "cpp",
+    "h",
+    "hpp",
+    "go",
+    "java",
+    "rb",
+    "php",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "vim",
+    "lua",
+    "r",
+    "swift",
+    "kt",
+    "cs",
+    "fs",
+    "hs",
+    "ex",
+    "exs",
+    "erl",
+    "clj",
+    "lisp",
+    "el",
+    "jl",
+    "toml",
+    "yaml",
+    "yml",
+    "json",
+    "jsonc",
+    "json5",
+    "xml",
+    "html",
+    "htm",
+    "css",
+    "scss",
+    "less",
+    "sql",
+    "graphql",
+    "proto",
+    "md",
+    "txt",
+    "csv",
+    "ini",
+    "cfg",
+    "conf",
+    "env",
+    "gitignore",
+    "gitattributes",
+    "dockerignore",
+    "dockerfile",
+    "makefile",
+    "cmake",
+    "nix",
+    "zig",
 ];
 
 /// Extensions rendered inline as images by the preview pane.
 pub const IMAGE_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico", "avif", "tiff",
-    "tif", "psd", "ai", "eps",
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico", "avif", "tiff", "tif", "psd", "ai",
+    "eps",
 ];
 
 /// Errors while listing a directory, split so handlers can map them to status
@@ -140,7 +196,9 @@ pub fn list_dir(dir: &Path) -> Result<Vec<FileTreeEntry>, ListError> {
             Err(_) => continue,
         };
         let is_dir = if ft.is_symlink() {
-            std::fs::metadata(item.path()).map(|m| m.is_dir()).unwrap_or(false)
+            std::fs::metadata(item.path())
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
         } else {
             ft.is_dir()
         };
@@ -197,7 +255,8 @@ pub fn search_files(base: &Path, query: &str, limit: usize) -> Vec<FileTreeEntry
             }
         }
         children.sort_by(|a, b| {
-            b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
         });
         for (name, is_dir) in children {
             let full = dir.join(&name);
@@ -213,13 +272,13 @@ pub fn search_files(base: &Path, query: &str, limit: usize) -> Vec<FileTreeEntry
                     mime,
                 });
                 if results.len() >= limit {
-                    results.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+                    results.sort_by_key(|e| e.path.to_lowercase());
                     return results;
                 }
             }
         }
     }
-    results.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+    results.sort_by_key(|e| e.path.to_lowercase());
     results
 }
 
@@ -273,6 +332,14 @@ pub fn mime_for_path(path: &str) -> &'static str {
         "exe" => "application/x-executable",
         "so" | "o" => "application/x-sharedlib",
 
+        // Web assets, ahead of the TEXT_EXTS fallback below: these extensions
+        // are also in TEXT_EXTS, but serving the embedded frontend through
+        // this table needs their real types or the browser rejects them.
+        "html" => "text/html",
+        "css" => "text/css",
+        "js" => "text/javascript",
+        "json" => "application/json",
+
         e if TEXT_EXTS.contains(&e) => "text/plain",
         _ => "application/octet-stream",
     }
@@ -305,7 +372,11 @@ fn sniff_mime(path: &Path) -> String {
 
     // Textual formats: skip a UTF-8 BOM and leading whitespace before looking
     // at the first meaningful byte (`{`/`[` = JSON, `<` = markup).
-    let mut i = if head.starts_with(&[0xef, 0xbb, 0xbf]) { 3 } else { 0 };
+    let mut i = if head.starts_with(&[0xef, 0xbb, 0xbf]) {
+        3
+    } else {
+        0
+    };
     while i < head.len() && matches!(head[i], b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c) {
         i += 1;
     }
@@ -318,9 +389,9 @@ fn sniff_mime(path: &Path) -> String {
         "text/html"
     } else if body.starts_with(b"<?xml") || body.starts_with(b"<") {
         "application/xml"
-    } else if head.starts_with(&[0x7f, b'E', b'L', b'F']) {
-        "application/x-executable"
-    } else if head.starts_with(b"MZ") {
+    } else if head.starts_with(&[0x7f, b'E', b'L', b'F']) || head.starts_with(b"MZ") {
+        // ELF (Linux) and MZ/PE (Windows) are both native executables and get
+        // the same type — the one and only executable arm.
         "application/x-executable"
     } else if head.starts_with(b"#!") {
         "text/x-script"
@@ -354,9 +425,11 @@ fn sniff_mime(path: &Path) -> String {
         "video/x-msvideo"
     } else if head.len() >= 8 && &head[4..8] == b"ftyp" {
         "video/mp4"
-    } else if head.starts_with(b"ID3") {
-        "audio/mpeg"
-    } else if head.len() >= 2 && head[0] == 0xff && (head[1] & 0xe0) == 0xe0 {
+    } else if head.starts_with(b"ID3")
+        || (head.len() >= 2 && head[0] == 0xff && (head[1] & 0xe0) == 0xe0)
+    {
+        // An ID3v2 tag prefixes the audio frames, a bare MPEG stream starts
+        // with the frame sync; both are mp3.
         "audio/mpeg"
     } else {
         "text/plain"
@@ -552,10 +625,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mime_for_path_maps_web_asset_extensions() {
+        // These must beat the TEXT_EXTS fallback: the static-asset handler
+        // serves `web/dist` straight from `mime_for_path`, and a wrong
+        // Content-Type here breaks the UI.
+        assert_eq!(mime_for_path("index.html"), "text/html");
+        assert_eq!(mime_for_path("style.css"), "text/css");
+        assert_eq!(mime_for_path("app.js"), "text/javascript");
+        assert_eq!(mime_for_path("data.json"), "application/json");
+        for name in ["index.html", "style.css", "app.js", "data.json"] {
+            assert_ne!(
+                mime_for_path(name),
+                "text/plain",
+                "{name} must not fall through to the text/plain arm"
+            );
+        }
+        // Case-insensitive, and the same answer for a full path.
+        assert_eq!(mime_for_path("/web/dist/APP.JS"), "text/javascript");
+    }
+
+    #[test]
+    fn mime_for_path_still_falls_back_to_text_plain() {
+        assert_eq!(mime_for_path("main.rs"), "text/plain");
+        assert_eq!(mime_for_path("notes.md"), "text/plain");
+        assert_eq!(mime_for_path("noextension"), "application/octet-stream");
+    }
+
+    #[test]
     fn mime_fields_classify_extensionless_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("script"), "#!/bin/sh\necho hi\n").unwrap();
-        std::fs::write(dir.path().join("blob"), [0x7f, b'E', b'L', b'F', 2, 1, 1, 0]).unwrap();
+        std::fs::write(
+            dir.path().join("blob"),
+            [0x7f, b'E', b'L', b'F', 2, 1, 1, 0],
+        )
+        .unwrap();
         std::fs::write(dir.path().join("plain"), "just text\n").unwrap();
         std::fs::write(dir.path().join("notes.md"), "# hi\n").unwrap();
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
@@ -572,9 +676,17 @@ mod tests {
     #[test]
     fn mime_fields_sniff_json_xml_and_html() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("project"), "{\n  \"type\": \"project\"\n}\n").unwrap();
+        std::fs::write(
+            dir.path().join("project"),
+            "{\n  \"type\": \"project\"\n}\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("session"), "[ \"a\", \"b\" ]\n").unwrap();
-        std::fs::write(dir.path().join("feed"), "<?xml version=\"1.0\"?>\n<root/>\n").unwrap();
+        std::fs::write(
+            dir.path().join("feed"),
+            "<?xml version=\"1.0\"?>\n<root/>\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("page"), "<!DOCTYPE html>\n<html></html>\n").unwrap();
 
         let entries = list_dir(dir.path()).unwrap();
@@ -583,6 +695,28 @@ mod tests {
         assert_eq!(by_name("session").mime, "application/json");
         assert_eq!(by_name("feed").mime, "application/xml");
         assert_eq!(by_name("page").mime, "text/html");
+    }
+
+    #[test]
+    fn sniff_mime_treats_elf_and_mz_the_same() {
+        // ELF (Linux) and MZ/PE (Windows) are both native executables; they
+        // share one arm in `sniff_mime` and must never diverge.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("elfbin"),
+            [0x7f, b'E', b'L', b'F', 2, 1, 1, 0],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("pebin"),
+            [b'M', b'Z', 0x90, 0x00, 0x03, 0x00],
+        )
+        .unwrap();
+
+        let entries = list_dir(dir.path()).unwrap();
+        let by_name = |n: &str| entries.iter().find(|e| e.name == n).unwrap();
+        assert_eq!(by_name("elfbin").mime, "application/x-executable");
+        assert_eq!(by_name("pebin").mime, "application/x-executable");
     }
 
     #[test]
@@ -756,10 +890,16 @@ mod tests {
         assert!(!dir.path().join("a.txt").exists());
 
         assert!(matches!(
-            rename_path(&dir.path().join("sub/b.txt"), &dir.path().join("nope/x.txt")),
+            rename_path(
+                &dir.path().join("sub/b.txt"),
+                &dir.path().join("nope/x.txt")
+            ),
             Err(FsError::Io(_))
         ));
-        assert!(matches!(rename_path(Path::new("/"), Path::new("/x")), Err(FsError::InvalidInput(_))));
+        assert!(matches!(
+            rename_path(Path::new("/"), Path::new("/x")),
+            Err(FsError::InvalidInput(_))
+        ));
     }
 
     #[test]
@@ -815,8 +955,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("run.sh"), "#!/bin/sh\necho hi\n").unwrap();
-        std::fs::set_permissions(dir.path().join("run.sh"), std::fs::Permissions::from_mode(0o751))
-            .unwrap();
+        std::fs::set_permissions(
+            dir.path().join("run.sh"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
 
         copy_path(&dir.path().join("run.sh"), &dir.path().join("copied.sh")).unwrap();
 

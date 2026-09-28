@@ -34,15 +34,17 @@ with zero external dependencies at runtime.
 - KDE `breeze-dark` icon theme for files and folders, served at runtime from
   the vendored theme under `res/icons/breeze-dark` (swap the folder to switch
   themes)
-- Single binary: the frontend is embedded with `rust-embed`; only the icon
-  theme is read from disk at runtime
+- Single binary: the frontend is embedded at build time via a generated
+  `include_bytes!` table; only the icon theme is read from disk at runtime
 
 ## Why not …
 
 - **No authentication, no JWT.** Folio binds to `127.0.0.1` only. It is a
   localhost tool, not a multi-user web app.
-- **No command execution.** Unlike some file web UIs, folio never runs
-  commands from a web request — browsing can't secretly escalate to a shell.
+- **No arbitrary command execution.** Browsing never runs anything. The single
+  exception is the explicit *Open with* action: it launches an application you
+  pick from the list of apps folio itself enumerated, with the target passed as
+  one argv element and no shell involved.
 - **No uploads/editor/share in v1.** Ideas tracked for later versions.
 
 ## Build
@@ -69,6 +71,51 @@ Then open http://127.0.0.1:4000 in a browser. The path bar shows where you
 are; files change on disk and the tree updates live through a WebSocket
 change-hint channel (HTTP is always the source of truth — the WS channel only
 says *what changed*, it never carries file content).
+
+## HTTP surface
+
+Every path is **absolute**; `--root` only sets the starting directory, and
+nothing is confined to it. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the
+pieces fit together.
+
+| Route | Method | Purpose |
+|---|---|---|
+| `/info` | GET | Starting directory and `$HOME` (for `~` in the path bar) |
+| `/filetree?path=` | GET | List one directory |
+| `/filecontent?path=[&raw=true]` | GET | Preview payload for a file, or the raw bytes |
+| `/fileinfo?path=` | GET | Metadata and media info for the properties panel |
+| `/filesearch?q=[&path=]` | GET | Recursive case-insensitive name search |
+| `/apps` | GET | Installed launchable applications, for the open-with dropdown |
+| `/defaultapp?mime=` | GET | Last-used app id for a MIME type |
+| `/open` | POST | Launch an enumerated app on a path, and remember it as the default |
+| `/rename` | POST | Rename or move `{path, to}` |
+| `/delete` | POST | Delete `{path}`, recursively for a directory |
+| `/paste` | POST | Copy or cut `sources` into `dest` (`cut` flag) |
+| `/icons/{theme}/{*path}` | GET | Icon-theme asset |
+| `/ws` | GET | Change-hint WebSocket (below) |
+| `/`, `/{*path}` | GET | The embedded frontend |
+
+Mutations answer `200` on success, `400` for invalid input, `404` for a missing
+path, `409` for an in-use destination (a cut that would overwrite), and `500`
+for io failures.
+
+## WebSocket protocol
+
+The socket at `/ws` carries **hints only** — never file content, tree
+snapshots, or auth state. It is bidirectional in the sense that both ends send,
+but each direction has exactly one message type:
+
+| Direction | Message | Effect |
+|---|---|---|
+| server → client | `{"type":"changed","path":"/abs/dir"}` | That directory's listing changed; refetch it over HTTP |
+| client → server | `{"type":"watch","path":"/abs/dir"}` | Retarget the file watcher at that directory |
+
+A client sends `watch` on connect and again after every navigation, so the
+server only ever watches the folder currently on screen. Hints are debounced
+(~200 ms server-side, ~150 ms client-side), so a burst of disk activity
+collapses into a single refetch. If the socket drops, the client reconnects
+with a 2 s backoff; a stale or missed hint is harmless because the next HTTP
+fetch always re-reads the filesystem.
 
 ## Tests
 

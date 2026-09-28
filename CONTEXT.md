@@ -20,13 +20,14 @@ Shared vocabulary for working on this project together.
 - **edit / open-with** — the preview header's ✎ button (with a ▾ caret) launches the file in the app last used for its MIME type; the caret (or first use) opens a dropdown of apps matching the file type. The last-used choice is persisted to `$XDG_CONFIG_HOME/bitshift/folio/config.json` (`/defaultapp` reads it, `/open` updates it). The `⋯` button is the Rename/Delete menu.
 - **text preview** — files render as a line-numbered table (`#preview-content .text-view`), not a raw `<pre>`; the header shows only the basename (full path in the title tooltip).
 - **properties** — the Preview ⋯ menu's Properties item splits the preview pane top/bottom, showing file details from `/fileinfo` (`name/path/size/modified/mode/mime`); media files add `media` info — image dimensions and duration for wav/flac/mp3/mp4 (hand-rolled header sniffers in `src/media.rs`). Selecting it again toggles the panel away; it also closes when the preview leaves the file.
+- **copy / cut / paste** — the client clipboard holds a single `{path, cut}` entry. **Ctrl+C** copies, **Ctrl+X** cuts, **Ctrl+V** pastes into the list pane's current dir (never the previewed item), **Esc** cancels a pending cut. Copy auto-uniquifies (`foo (copy).txt`, `foo (copy 2).txt`, …); cut refuses collisions (409) and leaves the source untouched. Rows on a pending cut render dimmed; the subtitle shows `Copied:` / `Cut:` / `Pasted → <dir>`. Clipboard is client state — the server is stateless and one `POST /paste` does the work.
 - **hints** — WS messages `{type:"changed", path}`. Principle: "HTTP is truth" — hints only trigger a refetch.
 - **dotfiles** — dot-prefixed names are hidden by default; **Ctrl+H** toggles visibility. Non-hidden filtering happens client-side at render time.
 - **watch** — client sends `{type:"watch", path}` so the server watcher follows the viewed dir.
 
 ## Server
 
-- Endpoints: `/info`, `/filetree`, `/filecontent`, `/fileinfo`, `/filesearch`, `/apps`, `/defaultapp`, `/rename` (POST), `/delete` (POST), `/open` (POST), `/ws`, `/icons/{theme}/{*path}`, embedded static `/`.
+- Endpoints: `/info`, `/filetree`, `/filecontent`, `/fileinfo`, `/filesearch`, `/apps`, `/defaultapp`, `/rename` (POST), `/delete` (POST), `/paste` (POST), `/open` (POST), `/ws`, `/icons/{theme}/{*path}`, embedded static `/`.
 - Paths are **absolute everywhere**; `--root` only sets the starting dir.
 - Mutation codes: 200 ok, 400 invalid, 404 missing, 409 in-use, 500 io.
 - Watching rules: `/` non-recursive, top-level `/proc /sys /dev` skipped, events kept only when the parent is the watched dir.

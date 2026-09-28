@@ -4,8 +4,6 @@
 
 pub mod static_files;
 
-use rust_embed::RustEmbed;
-
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -16,12 +14,13 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use tower_http::cors::CorsLayer;
 use notify::Watcher;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
+use tower_http::cors::CorsLayer;
 
 use crate::apps;
+use crate::assets;
 use crate::config;
 use crate::fs;
 use crate::media;
@@ -31,13 +30,6 @@ use crate::media;
 const WATCH_DEBOUNCE_MS: u64 = 200;
 /// Search result cap, matching the web UI's single-fetch expectation.
 const SEARCH_LIMIT: usize = 200;
-
-/// Icon themes embedded into the binary so they load in release builds
-/// regardless of the working directory. Served as a fallback when no
-/// matching file is found on disk (themes_dir).
-#[derive(RustEmbed)]
-#[folder = "res/icons"]
-struct IconAssets;
 
 /// A server-pushed change hint. HTTP remains the source of truth; the
 /// WebSocket only tells clients which directory to refetch.
@@ -95,11 +87,7 @@ impl AppState {
     }
 
     pub fn spawn_watcher(&self) {
-        let rx = self
-            .watch_rx
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take());
+        let rx = self.watch_rx.lock().ok().and_then(|mut guard| guard.take());
         let Some(rx) = rx else {
             tracing::warn!("file watcher already spawned once");
             return;
@@ -140,34 +128,33 @@ pub async fn icon_handler(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let rel = Path::new(&path);
-    let rel_ok = !rel
-        .components()
-        .any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)));
+    let rel_ok = !rel.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    });
     if !rel_ok {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let file = state.themes_dir.join(&theme).join(rel);
     match std::fs::read(&file) {
-        Ok(bytes) => {
-            let mime = if file.extension().is_some_and(|e| e == "svg") {
-                "image/svg+xml"
-            } else {
-                fs::mime_for_path(&file.display().to_string())
-            };
-            ([(header::CONTENT_TYPE, mime)], bytes).into_response()
-        }
+        Ok(bytes) => (
+            [(
+                header::CONTENT_TYPE,
+                fs::mime_for_path(&file.display().to_string()),
+            )],
+            bytes,
+        )
+            .into_response(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Fall back to the copy embedded in the binary, so release
             // builds work even when launched outside the project dir where
             // res/icons doesn't exist on disk.
-            match IconAssets::get(&format!("{theme}/{}", rel.display())) {
+            let key = format!("res/icons/{theme}/{}", rel.display());
+            match assets::get(&key) {
                 Some(content) => {
-                    let mime = fs::mime_for_path(&format!("{theme}/{}", rel.display()));
-                    (
-                        [(header::CONTENT_TYPE, mime)],
-                        content.data.into_owned(),
-                    )
-                        .into_response()
+                    ([(header::CONTENT_TYPE, fs::mime_for_path(&key))], content).into_response()
                 }
                 None => StatusCode::NOT_FOUND.into_response(),
             }
@@ -327,7 +314,11 @@ pub async fn fileinfo_handler(
         } else {
             fs::mime_for_entry(&base, &name).to_string()
         };
-        let media = if is_dir { None } else { media::probe(&base, &mime) };
+        let media = if is_dir {
+            None
+        } else {
+            media::probe(&base, &mime)
+        };
         Some(FileInfo {
             name,
             path: path_str,
@@ -345,7 +336,11 @@ pub async fn fileinfo_handler(
         Ok(None) => (StatusCode::NOT_FOUND, Json(MutateResponse { ok: false })).into_response(),
         Err(e) => {
             tracing::warn!("fileinfo task panicked: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(MutateResponse { ok: false })).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MutateResponse { ok: false }),
+            )
+                .into_response()
         }
     }
 }
@@ -396,11 +391,7 @@ pub async fn rename_handler(
     Json(body): Json<MutateRequest>,
 ) -> Response {
     if body.to.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(MutateResponse { ok: false }),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, Json(MutateResponse { ok: false })).into_response();
     }
     let from = resolve_path(&body.path, &state.root_marker);
     let to = resolve_path(&body.to, &state.root_marker);
@@ -462,11 +453,7 @@ pub async fn delete_handler(
         }
         Ok(Err(fs::FsError::Io(e))) => {
             tracing::warn!("delete failed: {e}");
-            (
-                StatusCode::CONFLICT,
-                Json(MutateResponse { ok: false }),
-            )
-                .into_response()
+            (StatusCode::CONFLICT, Json(MutateResponse { ok: false })).into_response()
         }
         Err(e) => {
             tracing::warn!("delete task panicked: {e}");
@@ -496,12 +483,14 @@ pub struct PasteResponse {
     path: Option<String>,
 }
 
-/// Why a paste could not complete, mapped to a status code by the handler.
+/// Why a paste could not complete, mapped to a status code by [`paste_failed`].
 enum PasteError {
     BadInput,
     NotFound,
     Conflict,
     Io(std::io::Error),
+    /// The blocking task itself failed, not the filesystem operation.
+    TaskFailed(String),
 }
 
 impl From<fs::FsError> for PasteError {
@@ -513,6 +502,75 @@ impl From<fs::FsError> for PasteError {
     }
 }
 
+fn paste_status(e: &PasteError) -> StatusCode {
+    match e {
+        PasteError::BadInput => StatusCode::BAD_REQUEST,
+        PasteError::NotFound => StatusCode::NOT_FOUND,
+        PasteError::Conflict => StatusCode::CONFLICT,
+        PasteError::Io(_) | PasteError::TaskFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Renders a failed paste: logs the interesting variants, then answers with
+/// the mapped status and the uniform `{ok:false}` body.
+fn paste_failed(e: PasteError) -> Response {
+    match &e {
+        PasteError::Io(err) => tracing::warn!("paste failed: {err}"),
+        PasteError::TaskFailed(msg) => tracing::warn!("paste task panicked: {msg}"),
+        _ => {}
+    }
+    (
+        paste_status(&e),
+        Json(PasteResponse {
+            ok: false,
+            path: None,
+        }),
+    )
+        .into_response()
+}
+
+/// Decides where one clipboard source lands inside `dest_dir`, and whether the
+/// operation is legal at all. A cut keeps the source's name and refuses a
+/// collision (the user renames or deletes first); a copy is uniquified so it
+/// can never overwrite. Also the home of the missing-source and
+/// unusable-name checks, so `paste_handler` only has to dispatch.
+fn resolve_paste_dest(src: &Path, dest_dir: &Path, cut: bool) -> Result<PathBuf, PasteError> {
+    if std::fs::symlink_metadata(src).is_err() {
+        return Err(PasteError::NotFound);
+    }
+    let name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or(PasteError::BadInput)?;
+    if cut {
+        let target = dest_dir.join(name);
+        if target.exists() {
+            return Err(PasteError::Conflict);
+        }
+        Ok(target)
+    } else {
+        Ok(fs::unique_copy_dest(dest_dir, name))
+    }
+}
+
+/// The directories whose listings change when a paste lands: every cut source's
+/// parent (the file leaves it) plus the destination. Sorted and deduped so a
+/// single hint per directory is broadcast.
+fn paste_affected_dirs(sources: &[PathBuf], dest_dir: &Path, cut: bool) -> Vec<String> {
+    let mut dirs: Vec<String> = if cut {
+        sources
+            .iter()
+            .map(|s| parent_of_abs(&s.display().to_string()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    dirs.push(dest_dir.display().to_string());
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 /// Copies or moves the clipboard's source paths into a destination directory.
 /// The client holds the clipboard; the server stays stateless. Copies never
 /// overwrite (the destination is uniquified), while cuts refuse collisions.
@@ -521,11 +579,7 @@ pub async fn paste_handler(
     Json(body): Json<PasteRequest>,
 ) -> Response {
     if body.sources.is_empty() || body.dest.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(PasteResponse { ok: false, path: None }),
-        )
-            .into_response();
+        return bad_paste();
     }
     let dest_dir = resolve_path(&body.dest, &state.root_marker);
     let sources: Vec<PathBuf> = body
@@ -534,27 +588,11 @@ pub async fn paste_handler(
         .map(|s| resolve_path(s, &state.root_marker))
         .collect();
     if sources.iter().any(|s| s == Path::new("/")) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(PasteResponse { ok: false, path: None }),
-        )
-            .into_response();
+        return bad_paste();
     }
+    let affected = paste_affected_dirs(&sources, &dest_dir, body.cut);
     let cut = body.cut;
-    let affected = {
-        let mut dirs: Vec<String> = if cut {
-            sources
-                .iter()
-                .map(|s| parent_of_abs(&s.display().to_string()))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        dirs.push(dest_dir.display().to_string());
-        dirs.sort();
-        dirs.dedup();
-        dirs
-    };
+
     let result = tokio::task::spawn_blocking(move || -> Result<String, PasteError> {
         match std::fs::metadata(&dest_dir) {
             Ok(m) if m.is_dir() => {}
@@ -563,29 +601,18 @@ pub async fn paste_handler(
         }
         let mut last = String::new();
         for src in &sources {
-            if std::fs::symlink_metadata(src).is_err() {
-                return Err(PasteError::NotFound);
-            }
-            let name = src
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or(PasteError::BadInput)?;
+            let target = resolve_paste_dest(src, &dest_dir, cut)?;
             if cut {
-                let target = dest_dir.join(name);
-                if target.exists() {
-                    return Err(PasteError::Conflict);
-                }
                 fs::move_path(src, &target)?;
-                last = target.display().to_string();
             } else {
-                let target = fs::unique_copy_dest(&dest_dir, name);
                 fs::copy_path(src, &target)?;
-                last = target.display().to_string();
             }
+            last = target.display().to_string();
         }
         Ok(last)
     })
     .await;
+
     match result {
         Ok(Ok(path)) => {
             broadcast_after_mutation(&state, affected);
@@ -598,38 +625,20 @@ pub async fn paste_handler(
             )
                 .into_response()
         }
-        Ok(Err(PasteError::BadInput)) => (
-            StatusCode::BAD_REQUEST,
-            Json(PasteResponse { ok: false, path: None }),
-        )
-            .into_response(),
-        Ok(Err(PasteError::NotFound)) => (
-            StatusCode::NOT_FOUND,
-            Json(PasteResponse { ok: false, path: None }),
-        )
-            .into_response(),
-        Ok(Err(PasteError::Conflict)) => (
-            StatusCode::CONFLICT,
-            Json(PasteResponse { ok: false, path: None }),
-        )
-            .into_response(),
-        Ok(Err(PasteError::Io(e))) => {
-            tracing::warn!("paste failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(PasteResponse { ok: false, path: None }),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            tracing::warn!("paste task panicked: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(PasteResponse { ok: false, path: None }),
-            )
-                .into_response()
-        }
+        Ok(Err(e)) => paste_failed(e),
+        Err(e) => paste_failed(PasteError::TaskFailed(e.to_string())),
     }
+}
+
+fn bad_paste() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(PasteResponse {
+            ok: false,
+            path: None,
+        }),
+    )
+        .into_response()
 }
 
 /// Lists installed desktop applications for the preview pane's "edit"
@@ -694,11 +703,19 @@ pub async fn open_handler(
         }
         Ok(Err(apps::LaunchError::Spawn(e))) => {
             tracing::warn!("open with failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(MutateResponse { ok: false })).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MutateResponse { ok: false }),
+            )
+                .into_response()
         }
         Err(e) => {
             tracing::warn!("open task panicked: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(MutateResponse { ok: false })).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MutateResponse { ok: false }),
+            )
+                .into_response()
         }
     }
 }
@@ -773,6 +790,53 @@ async fn hint_socket(mut socket: WebSocket, state: AppState) {
     }
 }
 
+/// Absorbs filesystem events until `WATCH_DEBOUNCE_MS` of quiet, then flushes
+/// the pending hints. The first event is expected to already be absorbed by
+/// the caller. Returns `false` when the event channel has closed, which means
+/// the watcher task should stop.
+async fn debounce(
+    event_rx: &mut mpsc::UnboundedReceiver<notify::Event>,
+    pending: &mut BTreeSet<String>,
+    watched: Option<&Path>,
+    tx: &broadcast::Sender<ChangeHint>,
+) -> bool {
+    loop {
+        let deadline = tokio::time::sleep(std::time::Duration::from_millis(WATCH_DEBOUNCE_MS));
+        tokio::pin!(deadline);
+        tokio::select! {
+            ev = event_rx.recv() => match ev {
+                Some(ev) => absorb(&ev, pending, watched),
+                None => return false,
+            },
+            _ = &mut deadline => {
+                flush(pending, tx);
+                return true;
+            }
+        }
+    }
+}
+
+/// Builds the `notify` watcher plus the channel its callback pushes events
+/// into. Returns `None` (after warning) if the watcher cannot start.
+fn build_watcher() -> Option<(
+    notify::RecommendedWatcher,
+    mpsc::UnboundedReceiver<notify::Event>,
+)> {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(ev) = res {
+            let _ = event_tx.send(ev);
+        }
+    });
+    match watcher {
+        Ok(w) => Some((w, event_rx)),
+        Err(e) => {
+            tracing::warn!("file watcher failed to start: {e}");
+            None
+        }
+    }
+}
+
 /// Watches whichever directory the frontend is viewing and broadcasts change
 /// hints, batching events through a short debounce so directory churn
 /// collapses into a single hint per affected directory. The frontend swaps the
@@ -784,19 +848,8 @@ fn spawn_watcher(
     tx: broadcast::Sender<ChangeHint>,
 ) {
     tokio::spawn(async move {
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut watcher = match notify::recommended_watcher(
-            move |res: notify::Result<notify::Event>| {
-                if let Ok(ev) = res {
-                    let _ = event_tx.send(ev);
-                }
-            },
-        ) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::warn!("file watcher failed to start: {e}");
-                return;
-            }
+        let Some((mut watcher, mut event_rx)) = build_watcher() else {
+            return;
         };
         let mut watched: Option<PathBuf> = None;
         set_watch(&mut watcher, &mut watched, initial);
@@ -809,21 +862,8 @@ fn spawn_watcher(
                         Some(ev) => absorb(&ev, &mut pending, watched.as_deref()),
                         None => return,
                     }
-                    loop {
-                        let deadline = tokio::time::sleep(std::time::Duration::from_millis(WATCH_DEBOUNCE_MS));
-                        tokio::pin!(deadline);
-                        tokio::select! {
-                            ev = event_rx.recv() => {
-                                match ev {
-                                    Some(ev) => absorb(&ev, &mut pending, watched.as_deref()),
-                                    None => return,
-                                }
-                            }
-                            _ = &mut deadline => {
-                                flush(&mut pending, &tx);
-                                break;
-                            }
-                        }
+                    if !debounce(&mut event_rx, &mut pending, watched.as_deref(), &tx).await {
+                        return;
                     }
                 }
                 w = watch_rx.recv() => {
@@ -951,6 +991,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn static_assets_are_served_with_real_content_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = app_for(dir.path());
+
+        let cases = [
+            ("/", "text/html"),
+            ("/index.html", "text/html"),
+            ("/app.js", "text/javascript"),
+            ("/style.css", "text/css"),
+            // A miss must 404 rather than fall through to a directory listing.
+            ("/nope", "text/plain"),
+        ];
+        for (uri, want) in cases {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            if want == "text/plain" {
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+                continue;
+            }
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let mime = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!(mime, want, "{uri}");
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store",
+                "{uri}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(!bytes.is_empty(), "{uri} served no bytes");
+        }
+    }
+
+    #[tokio::test]
+    async fn static_root_serves_the_app_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = app_for(dir.path())
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&bytes);
+        assert!(html.contains("<html"), "root must be the app shell");
+    }
+
+    #[tokio::test]
     async fn info_reports_root_and_home() {
         let dir = tempfile::tempdir().unwrap();
         let response = app_for(dir.path())
@@ -995,7 +1093,9 @@ mod tests {
         assert!(names.contains(&"src"), "got: {names:?}");
         assert!(names.contains(&"Cargo.toml"), "got: {names:?}");
         assert_eq!(names.len(), 2);
-        assert!(entries.iter().any(|e| e.is_dir && e.path == format!("{root_s}/src")));
+        assert!(entries
+            .iter()
+            .any(|e| e.is_dir && e.path == format!("{root_s}/src")));
         assert!(entries
             .iter()
             .any(|e| !e.is_dir && e.path == format!("{root_s}/Cargo.toml")));
@@ -1053,13 +1153,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn icon_serves_theme_files_and_blocks_traversal() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let theme_root = dir.path().join("res").join("icons");
         std::fs::create_dir_all(theme_root.join("test-theme/mimetypes/96")).unwrap();
-        let mut file = std::fs::File::create(theme_root.join("test-theme/mimetypes/96/x.svg")).unwrap();
+        let mut file =
+            std::fs::File::create(theme_root.join("test-theme/mimetypes/96/x.svg")).unwrap();
         file.write_all(b"<svg></svg>").unwrap();
 
         let state = AppState::new(dir.path().to_path_buf());
@@ -1120,7 +1221,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn icon_falls_back_to_embedded_theme() {
         // Simulates a release build launched from a directory with no
         // res/icons on disk: themes_dir points at an empty tree, so the
@@ -1152,7 +1253,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&bytes).contains("<svg"));
     }
 
-#[test]
+    #[test]
     fn parent_of_abs_reduces_to_parent_dir() {
         assert_eq!(parent_of_abs("/etc/x"), "/etc");
         assert_eq!(parent_of_abs("/etc/"), "/");
@@ -1176,11 +1277,7 @@ mod tests {
         assert!(pending.contains("/home/u/watchdir"));
 
         // deep change under a subdir -> ignored (parent != watched dir)
-        absorb(
-            &ev("/home/u/watchdir/sub/b.txt"),
-            &mut pending,
-            Some(root),
-        );
+        absorb(&ev("/home/u/watchdir/sub/b.txt"), &mut pending, Some(root));
         assert_eq!(pending.len(), 1, "deep events must not surface");
 
         // change outside the watched dir -> ignored
@@ -1214,8 +1311,7 @@ mod tests {
             .uri("/paste")
             .header("content-type", "application/json")
             .body(Body::from(
-                serde_json::json!({ "sources": sources, "dest": dest, "cut": cut })
-                    .to_string(),
+                serde_json::json!({ "sources": sources, "dest": dest, "cut": cut }).to_string(),
             ))
             .unwrap()
     }
@@ -1259,7 +1355,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.ok);
         let expected = dest.join("a.txt");
-        assert_eq!(body.path.as_deref(), Some(expected.display().to_string().as_str()));
+        assert_eq!(
+            body.path.as_deref(),
+            Some(expected.display().to_string().as_str())
+        );
         assert_eq!(std::fs::read(&expected).unwrap(), b"hello\n");
         assert!(src.exists(), "copy must leave the source in place");
     }
@@ -1284,7 +1383,10 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         let expected = dest.join("a (copy).txt");
-        assert_eq!(body.path.as_deref(), Some(expected.display().to_string().as_str()));
+        assert_eq!(
+            body.path.as_deref(),
+            Some(expected.display().to_string().as_str())
+        );
         assert_eq!(std::fs::read(&expected).unwrap(), b"new\n");
         assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"old\n");
     }
@@ -1308,7 +1410,10 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         let expected = dest.join("a.txt");
-        assert_eq!(body.path.as_deref(), Some(expected.display().to_string().as_str()));
+        assert_eq!(
+            body.path.as_deref(),
+            Some(expected.display().to_string().as_str())
+        );
         assert_eq!(std::fs::read(&expected).unwrap(), b"data\n");
         assert!(!src.exists(), "cut must remove the source");
     }

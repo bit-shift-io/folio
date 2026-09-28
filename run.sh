@@ -1,2 +1,3 @@
 #!/usr/bin/env bash
-cargo run "$@"
+# The `--` keeps our own flags (`--root`, `--port`) from being eaten by cargo.
+exec cargo run -- "$@"
