@@ -41,21 +41,26 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // The config file owns the bind host; `--port` still owns the port. Grit's
+    // settings page writes `host` there.
+    let config = folio::config::load();
+
     let state = server::AppState::new(root.clone());
     state.spawn_watcher();
     let app = server::build_router(state);
 
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await {
+    let listener = match tokio::net::TcpListener::bind((config.host.as_str(), args.port)).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("failed to bind 127.0.0.1:{}: {e}", args.port);
+            tracing::error!("failed to bind {}:{}: {e}", config.host, args.port);
             std::process::exit(1);
         }
     };
 
     tracing::info!(
-        "folio serving {} at http://127.0.0.1:{}/",
+        "folio serving {} at http://{}:{}/",
         root.display(),
+        config.host,
         args.port
     );
 

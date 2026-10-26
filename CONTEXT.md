@@ -39,4 +39,4 @@ Shared vocabulary for working on this project together.
 - Never git init/commit/push unless explicitly asked.
 - Bar: zero compiler warnings; keep unit + integration tests green.
 - No browser/js/node in this dev env — JS is verified by review + curl; the user eyeballs visuals.
-- Security: the `127.0.0.1` binding is the boundary. Only exception to "no spawning": `/open` may launch a user-picked installed app (verified `.desktop` id, argv built server-side, no shell).
+- Security: the bind host is the boundary, and it defaults to `127.0.0.1`. Grit's settings page can set `"host": "0.0.0.0"` in `~/.config/bitshift/folio/config.json`, which knowingly removes it. Only exception to "no spawning": `/open` may launch a user-picked installed app (verified `.desktop` id, argv built server-side, no shell).

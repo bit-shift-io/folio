@@ -6,7 +6,7 @@
 
 ## 1. Executive Overview
 
-**Project Goal:** A fast, single-binary local web file explorer written in Rust. It browses the whole filesystem over plain HTTP on `127.0.0.1`, starting at one directory, with a minimal browser-only frontend (no build step, no framework).
+**Project Goal:** A fast, single-binary local web file explorer written in Rust. It browses the whole filesystem over plain HTTP on `127.0.0.1` by default (the bind host is configurable), starting at one directory, with a minimal browser-only frontend (no build step, no framework).
 
 ### Key Technology Stack
 
@@ -314,9 +314,12 @@ folio documents.
 
 * **No root confinement.** The browser can navigate the entire filesystem, and
   path arguments are resolved by the OS (absolute paths used as-is, relative
-  ones joined onto the resolved base). The safety boundary is *binding to
-  `127.0.0.1` only* — a localhost tool, with no authentication surface and no
-  CSRF-exposed endpoints beyond what a same-machine user already controls.
+  ones joined onto the resolved base). The safety boundary is *the bind host*:
+  loopback by default, a localhost tool with no authentication surface and no
+  CSRF-exposed endpoints beyond what a same-machine user already controls. The
+  host is set in `config.json` (`"host"`), which Grit's settings page toggles;
+  `0.0.0.0` deliberately gives that boundary up and exposes the filesystem to
+  the network with no authentication.
 * **Destructive operations are guarded:** deleting or renaming `/` is refused
   (`400`). Delete uses `symlink_metadata` so a symlink is removed as a link,
   never dereferenced into a `remove_dir_all` of its target. Duplicate/other
@@ -343,10 +346,10 @@ folio documents.
 |---|---|
 | Hints-only WS, HTTP-is-truth | File browsing is read-heavy; a full state channel duplicates truth and races with disk |
 | Watcher follows the viewed dir | Only the folder you're looking at is watched — no wasted inotify watches across the whole filesystem |
-| Absolute paths, no confinement | The browser IS the filesystem (per the spec); `127.0.0.1` binding is the whole security story |
+| Absolute paths, no confinement | The browser IS the filesystem (per the spec); the bind host is the whole security story, and it defaults to `127.0.0.1` |
 | Notify watcher + HTTP mutations | Mutations are authoritative writers; the watcher keeps *other* tabs honest about external changes (e.g. edits made in an IDE) |
 | Debounce both sides (200 ms server, 150 ms client) | Collapses bursty events (git checkouts, save sprees) into a handful of refetches |
-| `127.0.0.1` bind, no auth | Localhost tool by design; avoids the auth/CSRF surface of remote file browsers (`filebrowser` lessons) |
+| Loopback bind by default, no auth | Localhost tool by design; avoids the auth/CSRF surface of remote file browsers (`filebrowser` lessons). Opting into LAN (`"host": "0.0.0.0"`) trades that away knowingly |
 | Folder tree + files list + per-dir cache | The left pane is an expandable lazy folder tree (whole-fs from `/`); the middle pane lists only the files of the open folder; `revealTree` keeps the open folder visible & highlighted; the path bar jumps anywhere instantly |
 | Generated `include_bytes!` table for the frontend | One binary, no CDN, no `dist/` install step, and no proc-macro/derive dependency in the hot path |
 | Hand-rolled CLI parser and desktop-entry reader | `clap` and `freedesktop-desktop-entry` were the two heaviest trees in the graph (147 → 110 production crates); folio needs ~40 lines of each, so it owns them instead |

@@ -2,7 +2,8 @@
 
 Fast, single-binary local web file explorer written in Rust.
 
-Folio is a full-filesystem browser served over plain HTTP on `127.0.0.1`.
+Folio is a full-filesystem browser served over plain HTTP, on `127.0.0.1` by
+default.
 It starts in the directory you give it (default: current), and from there you
 can navigate anywhere — `..` walks up level by level and an editable path bar
 jumps to any path. Lazy directory loading, instant filename search, inline
@@ -39,7 +40,10 @@ with zero external dependencies at runtime.
 
 ## Why not …
 
-- **No authentication, no JWT.** Folio binds to `127.0.0.1` only. It is a
+- **No authentication, no JWT.** Folio binds to `127.0.0.1` unless LAN access is
+  turned on in `~/.config/bitshift/folio/config.json` (`"host": "0.0.0.0"`), which
+  Grit's settings page toggles. Binding publicly exposes the whole filesystem to
+  the network, with no authentication. It is a
   localhost tool, not a multi-user web app.
 - **No arbitrary command execution.** Browsing never runs anything. The single
   exception is the explicit *Open with* action: it launches an application you

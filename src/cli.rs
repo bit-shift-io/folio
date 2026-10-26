@@ -10,7 +10,8 @@ pub struct Args {
     /// Initial directory to browse. Only sets where the browser starts — the
     /// server itself is not confined to it.
     pub root: PathBuf,
-    /// Port to bind on `127.0.0.1`.
+    /// Port to bind on. The host comes from `config.json` (loopback unless
+    /// Grit's settings page turned LAN access on).
     pub port: u16,
 }
 
@@ -42,7 +43,8 @@ Usage: folio [OPTIONS]
 
 Options:
   -r, --root <DIR>    Initial directory to browse (default: current directory)
-  -p, --port <PORT>   Port to bind on 127.0.0.1 (default: 4000)
+  -p, --port <PORT>   Port to bind on (default: 4000); the host comes from
+                      ~/.config/bitshift/folio/config.json (default 127.0.0.1)
   -h, --help          Print this help and exit
   -V, --version       Print version and exit";
 
